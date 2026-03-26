@@ -7,6 +7,7 @@ Run locally:
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -33,6 +34,7 @@ from services.payment import (
     create_payment_link,
     handle_payment_webhook,
     is_user_paid,
+    payments_enabled,
     verify_callback_signature,
 )
 from services.whatsapp import send_text_message
@@ -40,13 +42,22 @@ from services.whatsapp import send_text_message
 load_dotenv()
 
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "biovision2025")
-FREE_REPORT_LIMIT = 3
+FREE_REPORT_LIMIT = int(os.getenv("FREE_REPORT_LIMIT", "3"))
+PROCESSING_CONCURRENCY = max(1, int(os.getenv("PROCESSING_CONCURRENCY", "3")))
+WHATSAPP_GRAPH_API_VERSION = os.getenv("WHATSAPP_GRAPH_API_VERSION", "v23.0")
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(app: FastAPI):
     await init_db()
+    app.state.background_tasks = set()
+    app.state.media_processing_semaphore = asyncio.Semaphore(PROCESSING_CONCURRENCY)
+    app.state.active_jobs = 0
     yield
+
+    tasks = list(app.state.background_tasks)
+    for task in tasks:
+        task.cancel()
 
 
 app = FastAPI(title="BioVision WhatsApp Bot", lifespan=lifespan)
@@ -60,18 +71,22 @@ async def root() -> dict[str, str]:
 @app.get("/health")
 async def health_check() -> dict[str, Any]:
     configured = {
-        "whatsapp_access_token": bool(os.getenv("WHATSAPP_ACCESS_TOKEN")),
-        "whatsapp_phone_number_id": bool(os.getenv("WHATSAPP_PHONE_NUMBER_ID")),
-        "anthropic_api_key": bool(os.getenv("ANTHROPIC_API_KEY")),
-        "google_vision_api_key": bool(os.getenv("GOOGLE_VISION_API_KEY")),
-        "razorpay_key_id": bool(os.getenv("RAZORPAY_KEY_ID")),
-        "razorpay_key_secret": bool(os.getenv("RAZORPAY_KEY_SECRET")),
-        "razorpay_webhook_secret": bool(os.getenv("RAZORPAY_WEBHOOK_SECRET")),
-        "app_url": bool(os.getenv("APP_URL")),
+        "whatsapp_access_token": _is_real_env_value(os.getenv("WHATSAPP_ACCESS_TOKEN")),
+        "whatsapp_phone_number_id": _is_real_env_value(os.getenv("WHATSAPP_PHONE_NUMBER_ID")),
+        "anthropic_api_key": _is_real_env_value(os.getenv("ANTHROPIC_API_KEY")),
+        "google_vision_api_key": _is_real_env_value(os.getenv("GOOGLE_VISION_API_KEY")),
+        "razorpay_key_id": _is_real_env_value(os.getenv("RAZORPAY_KEY_ID")),
+        "razorpay_key_secret": _is_real_env_value(os.getenv("RAZORPAY_KEY_SECRET")),
+        "razorpay_webhook_secret": _is_real_env_value(os.getenv("RAZORPAY_WEBHOOK_SECRET")),
+        "app_url": _is_real_env_value(os.getenv("APP_URL")),
+        "payments_enabled": payments_enabled(),
     }
     return {
         "status": "ok",
         "verify_token_configured": bool(os.getenv("WHATSAPP_VERIFY_TOKEN")),
+        "processing_concurrency": PROCESSING_CONCURRENCY,
+        "active_jobs": getattr(app.state, "active_jobs", 0),
+        "queued_background_tasks": len(getattr(app.state, "background_tasks", set())),
         "services": configured,
     }
 
@@ -86,50 +101,28 @@ async def verify_webhook(request: Request) -> Response:
 
 
 @app.post("/webhook")
-async def receive_message(request: Request) -> dict[str, str]:
+async def receive_message(request: Request) -> dict[str, Any]:
     body = await request.json()
 
     try:
-        message_data = extract_message_payload(body)
-        if not message_data:
+        messages = extract_message_payloads(body)
+        if not messages:
             return {"status": "ignored"}
 
-        phone = message_data["from"]
-        contact_name = message_data.get("name", "")
-        message_type = message_data["type"]
-
-        user = await get_or_create_user(phone, contact_name)
-        report_count = await get_user_report_count(phone)
-        paid = await is_user_paid(phone)
-
-        if message_type == "text":
-            incoming_text = message_data.get("text", "").strip().lower()
-            await handle_text(phone, incoming_text, user, report_count, paid)
-        elif message_type == "image":
-            await handle_media(phone, message_data["media_id"], "image", user, report_count, paid)
-        elif message_type == "document":
-            mime_type = message_data.get("mime_type", "")
-            if "pdf" not in mime_type.lower():
-                await safe_send_text(
-                    phone,
-                    "❌ Abhi sirf report ki photo ya PDF support hoti hai. Kripya wahi bhejein.",
-                )
-            else:
-                await handle_media(phone, message_data["media_id"], "pdf", user, report_count, paid)
-        else:
-            await safe_send_text(
-                phone,
-                "📎 Is type ka message abhi support nahi hai.\nPhoto, PDF, ya text message bhejiye.",
-            )
+        for message_data in messages:
+            _spawn_background_task(process_message_job(message_data))
 
     except Exception as exc:
         print(f"Webhook processing error: {exc}")
 
-    return {"status": "ok"}
+    return {"status": "accepted", "queued_messages": len(messages)}
 
 
 @app.post("/payments/razorpay/webhook")
 async def razorpay_webhook(request: Request) -> dict[str, bool]:
+    if not payments_enabled():
+        return {"processed": False}
+
     raw_body = await request.body()
     signature = request.headers.get("X-Razorpay-Signature", "")
     payload = await request.json()
@@ -144,6 +137,15 @@ async def razorpay_webhook(request: Request) -> dict[str, bool]:
 
 @app.get("/payment-success", response_class=HTMLResponse)
 async def payment_success(request: Request) -> HTMLResponse:
+    if not payments_enabled():
+        return HTMLResponse(
+            content=_payment_page_html(
+                "Payments Disabled",
+                "Is deployment mein payments disabled hain.",
+            ),
+            status_code=200,
+        )
+
     query_params = {key: value for key, value in request.query_params.items()}
     payment_link_status = query_params.get("razorpay_payment_link_status", "").lower()
     payment_link_id = query_params.get("razorpay_payment_link_id", "")
@@ -152,7 +154,7 @@ async def payment_success(request: Request) -> HTMLResponse:
         return HTMLResponse(
             content=_payment_page_html(
                 "Payment Pending",
-                "Payment abhi confirm nahi hua. Agar paise कट गए hain to 1-2 minute baad WhatsApp check karein.",
+                "Payment abhi confirm nahi hua. Agar paise kat gaye hain to 1-2 minute baad WhatsApp check karein.",
             ),
             status_code=200,
         )
@@ -185,15 +187,66 @@ async def payment_success(request: Request) -> HTMLResponse:
     )
 
 
+def _spawn_background_task(coro: Any) -> None:
+    task = asyncio.create_task(coro)
+    app.state.background_tasks.add(task)
+    task.add_done_callback(app.state.background_tasks.discard)
+
+
+async def process_message_job(message_data: dict[str, Any]) -> None:
+    app.state.active_jobs += 1
+
+    try:
+        phone = message_data["from"]
+        contact_name = message_data.get("name", "")
+        message_type = message_data["type"]
+
+        user = await get_or_create_user(phone, contact_name)
+        report_count = await get_user_report_count(phone)
+        paid = await is_user_paid(phone)
+        payments_on = payments_enabled()
+
+        if message_type == "text":
+            incoming_text = message_data.get("text", "").strip().lower()
+            await handle_text(phone, incoming_text, user, report_count, paid, payments_on)
+        elif message_type == "image":
+            async with app.state.media_processing_semaphore:
+                await handle_media(phone, message_data["media_id"], "image", user, report_count, paid, payments_on)
+        elif message_type == "document":
+            mime_type = message_data.get("mime_type", "")
+            if "pdf" not in mime_type.lower():
+                await safe_send_text(
+                    phone,
+                    "❌ Abhi sirf report ki photo ya PDF support hoti hai. Kripya wahi bhejein.",
+                )
+            else:
+                async with app.state.media_processing_semaphore:
+                    await handle_media(phone, message_data["media_id"], "pdf", user, report_count, paid, payments_on)
+        else:
+            await safe_send_text(
+                phone,
+                "📎 Is type ka message abhi support nahi hai.\nPhoto, PDF, ya text message bhejiye.",
+            )
+
+    except Exception as exc:
+        print(f"Background message processing error: {exc}")
+    finally:
+        app.state.active_jobs = max(0, app.state.active_jobs - 1)
+
+
 async def handle_text(
     phone: str,
     text: str,
     user: dict,
     report_count: int,
     paid: bool,
+    payments_on: bool,
 ) -> None:
     if _matches_any(text, ["hi", "hello", "helo", "hey", "start", "menu", "help", "namaste"]):
-        await safe_send_text(phone, get_welcome_message(user.get("name", ""), report_count, paid))
+        await safe_send_text(
+            phone,
+            get_welcome_message(user.get("name", ""), report_count, paid, payments_on),
+        )
         return
 
     if _matches_any(text, ["kaise", "how", "use", "steps", "guide"]):
@@ -201,11 +254,14 @@ async def handle_text(
         return
 
     if _matches_any(text, ["price", "pricing", "cost", "kitna"]):
-        await safe_send_text(phone, get_pricing_message())
+        await safe_send_text(phone, get_pricing_message(payments_on))
         return
 
     if _matches_any(text, ["pay", "premium", "subscription", "subscribe", "unlock"]):
-        await safe_send_text(phone, await get_payment_required_message(phone, user.get("name", "")))
+        await safe_send_text(
+            phone,
+            await get_payment_required_message(phone, user.get("name", ""), payments_on),
+        )
         return
 
     if _matches_any(text, ["history", "reports", "past report", "old report"]):
@@ -216,12 +272,15 @@ async def handle_text(
         await safe_send_text(phone, await get_status_message(phone))
         return
 
-    if report_count < FREE_REPORT_LIMIT or paid:
+    if not payments_on or report_count < FREE_REPORT_LIMIT or paid:
         remaining = max(FREE_REPORT_LIMIT - report_count, 0)
-        await safe_send_text(phone, get_report_prompt(remaining, paid))
+        await safe_send_text(phone, get_report_prompt(remaining, paid, payments_on))
         return
 
-    await safe_send_text(phone, await get_payment_required_message(phone, user.get("name", "")))
+    await safe_send_text(
+        phone,
+        await get_payment_required_message(phone, user.get("name", ""), payments_on),
+    )
 
 
 async def handle_media(
@@ -231,9 +290,13 @@ async def handle_media(
     user: dict,
     report_count: int,
     paid: bool,
+    payments_on: bool,
 ) -> None:
-    if report_count >= FREE_REPORT_LIMIT and not paid:
-        await safe_send_text(phone, await get_payment_required_message(phone, user.get("name", "")))
+    if payments_on and report_count >= FREE_REPORT_LIMIT and not paid:
+        await safe_send_text(
+            phone,
+            await get_payment_required_message(phone, user.get("name", ""), payments_on),
+        )
         return
 
     await safe_send_text(
@@ -276,7 +339,7 @@ async def handle_media(
 
         new_count = report_count + 1
         remaining = max(FREE_REPORT_LIMIT - new_count, 0)
-        await safe_send_text(phone, get_follow_up_message(remaining, paid))
+        await safe_send_text(phone, get_follow_up_message(remaining, paid, payments_on))
 
     except Exception as exc:
         print(f"Media processing error: {exc}")
@@ -303,7 +366,7 @@ async def get_whatsapp_media_url(media_id: str) -> str:
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.get(
-            f"https://graph.facebook.com/v18.0/{media_id}",
+            f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{media_id}",
             headers={"Authorization": f"Bearer {token}"},
         )
         response.raise_for_status()
@@ -315,49 +378,68 @@ async def get_whatsapp_media_url(media_id: str) -> str:
     return media_url
 
 
-def extract_message_payload(body: dict) -> dict[str, Any]:
-    entries = body.get("entry", [])
-    if not entries:
-        return {}
+def extract_message_payloads(body: dict) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for entry in body.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            messages = value.get("messages", []) or []
+            contacts = value.get("contacts", []) or []
+            contact_name = ""
+            if contacts:
+                contact_name = contacts[0].get("profile", {}).get("name", "").strip()
 
-    changes = entries[0].get("changes", [])
-    if not changes:
-        return {}
+            for message in messages:
+                message_type = message.get("type")
+                payload: dict[str, Any] = {
+                    "from": message.get("from", ""),
+                    "type": message_type,
+                    "name": contact_name,
+                }
 
-    value = changes[0].get("value", {})
-    messages = value.get("messages")
-    if not messages:
-        return {}
+                if message_type == "text":
+                    payload["text"] = message.get("text", {}).get("body", "")
+                elif message_type == "image":
+                    payload["media_id"] = message.get("image", {}).get("id", "")
+                elif message_type == "document":
+                    payload["media_id"] = message.get("document", {}).get("id", "")
+                    payload["mime_type"] = message.get("document", {}).get("mime_type", "")
 
-    contacts = value.get("contacts", [])
-    contact_name = ""
-    if contacts:
-        contact_name = contacts[0].get("profile", {}).get("name", "").strip()
+                if payload.get("from") and payload.get("type"):
+                    payloads.append(payload)
 
-    message = messages[0]
-    message_type = message.get("type")
-    payload: dict[str, Any] = {
-        "from": message.get("from", ""),
-        "type": message_type,
-        "name": contact_name,
-    }
-
-    if message_type == "text":
-        payload["text"] = message.get("text", {}).get("body", "")
-    elif message_type == "image":
-        payload["media_id"] = message.get("image", {}).get("id", "")
-    elif message_type == "document":
-        payload["media_id"] = message.get("document", {}).get("id", "")
-        payload["mime_type"] = message.get("document", {}).get("mime_type", "")
-
-    return payload
+    return payloads
 
 
 def _matches_any(text: str, keywords: list[str]) -> bool:
     return any(keyword in text for keyword in keywords)
 
 
-def get_pricing_message() -> str:
+def _is_real_env_value(value: str | None) -> bool:
+    if not value:
+        return False
+
+    lowered = value.strip().lower()
+    placeholder_markers = [
+        "your_",
+        "your_key_here",
+        "https://your-",
+        "sk-ant-your",
+        "aiza_your",
+        "rzp_live_or_test_",
+        "rzp_test_your",
+    ]
+    return not any(marker in lowered for marker in placeholder_markers)
+
+
+def get_pricing_message(payments_on: bool) -> str:
+    if not payments_on:
+        return (
+            "💰 *BioVision Pricing*\n\n"
+            "Is build mein payments disabled hain.\n"
+            "Aap demo/testing ke liye reports free mein bhej sakte hain."
+        )
+
     return (
         "💰 *BioVision Pricing*\n\n"
         "🎁 Free Trial: 3 reports free\n"
@@ -370,7 +452,13 @@ def get_pricing_message() -> str:
     )
 
 
-async def get_payment_required_message(phone: str, name: str) -> str:
+async def get_payment_required_message(phone: str, name: str, payments_on: bool) -> str:
+    if not payments_on:
+        return (
+            "✅ Is build mein payments disabled hain.\n"
+            "Seedha apni report ki photo ya PDF bhejiye."
+        )
+
     try:
         payment_link = await create_payment_link(phone, name or "Patient")
         payment_text = f"👉 Premium unlock link:\n{payment_link}"
@@ -414,13 +502,16 @@ async def get_status_message(phone: str) -> str:
     report_count = details.get("report_count", 0)
     paid_until_raw = details.get("paid_until")
     paid = await is_user_paid(phone)
+    payments_on = payments_enabled()
 
     lines = [
         "📊 *Aapka account status*",
         f"Used reports: {report_count}",
     ]
 
-    if paid and paid_until_raw:
+    if not payments_on:
+        lines.append("Payments disabled: unlimited demo mode active")
+    elif paid and paid_until_raw:
         lines.append(f"Premium active till: {_format_date(paid_until_raw, include_time=True)}")
     elif paid:
         lines.append("Premium active hai.")
@@ -431,13 +522,16 @@ async def get_status_message(phone: str) -> str:
     return "\n".join(lines)
 
 
-def get_welcome_message(name: str, report_count: int, paid: bool) -> str:
+def get_welcome_message(name: str, report_count: int, paid: bool, payments_on: bool) -> str:
     remaining = max(FREE_REPORT_LIMIT - report_count, 0)
-    plan_line = (
-        "⭐ Premium active hai. Aap unlimited reports bhej sakte hain."
-        if paid
-        else f"🎁 Aapke paas {remaining} free report(s) bachi hain."
-    )
+    if not payments_on:
+        plan_line = "🆓 Demo mode active hai. Aap reports free mein bhej sakte hain."
+    else:
+        plan_line = (
+            "⭐ Premium active hai. Aap unlimited reports bhej sakte hain."
+            if paid
+            else f"🎁 Aapke paas {remaining} free report(s) bachi hain."
+        )
 
     return (
         f"🩺 *BioVision mein swagat hai!*\n\n"
@@ -463,8 +557,10 @@ def get_how_to_use() -> str:
     )
 
 
-def get_report_prompt(remaining: int, paid: bool) -> str:
-    if paid:
+def get_report_prompt(remaining: int, paid: bool, payments_on: bool) -> str:
+    if not payments_on:
+        header = "📄 Demo mode active hai. Apni report ki photo ya PDF bhejiye."
+    elif paid:
         header = "📄 Premium active hai. Apni report ki photo ya PDF bhejiye."
     else:
         header = f"📄 Apni report ki photo ya PDF bhejiye.\nAapke paas {remaining} free report(s) bachi hain."
@@ -478,8 +574,10 @@ def get_report_prompt(remaining: int, paid: bool) -> str:
     )
 
 
-def get_follow_up_message(remaining: int, paid: bool) -> str:
-    if paid:
+def get_follow_up_message(remaining: int, paid: bool, payments_on: bool) -> str:
+    if not payments_on:
+        trial_line = "Demo mode active hai, aap aur reports bhi bhej sakte hain."
+    elif paid:
         trial_line = "Premium active hai, isliye aap aur reports bhi bhej sakte hain."
     else:
         trial_line = f"Free reports remaining: {remaining}"

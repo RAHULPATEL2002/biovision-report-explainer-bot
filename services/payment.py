@@ -21,6 +21,29 @@ RAZORPAY_BASE = "https://api.razorpay.com/v1"
 MONTHLY_PRICE_PAISE = 19900
 
 
+def _looks_like_placeholder(value: str | None) -> bool:
+    if not value:
+        return True
+
+    lowered = value.strip().lower()
+    return (
+        lowered.startswith("your_")
+        or "your_key_here" in lowered
+        or lowered.startswith("rzp_live_or_test_")
+        or lowered.startswith("rzp_test_your")
+    )
+
+
+def payments_enabled() -> bool:
+    flag = os.getenv("PAYMENTS_ENABLED", "false").strip().lower()
+    if flag not in {"1", "true", "yes", "on"}:
+        return False
+
+    key_id = os.getenv("RAZORPAY_KEY_ID")
+    key_secret = os.getenv("RAZORPAY_KEY_SECRET")
+    return not _looks_like_placeholder(key_id) and not _looks_like_placeholder(key_secret)
+
+
 def _require_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
@@ -41,6 +64,9 @@ def _build_reference_id(phone: str) -> str:
 
 async def create_payment_link(phone: str, name: str) -> str:
     """Create a Razorpay payment link and store it locally."""
+    if not payments_enabled():
+        raise RuntimeError("Payments are disabled.")
+
     app_url = os.getenv("APP_URL", "").rstrip("/")
     callback_url = os.getenv("PAYMENT_CALLBACK_URL") or (
         f"{app_url}/payment-success" if app_url else "https://example.com/payment-success"
@@ -101,12 +127,18 @@ async def create_payment_link(phone: str, name: str) -> str:
 
 
 async def is_user_paid(phone: str) -> bool:
+    if not payments_enabled():
+        return True
+
     from database.users import get_user_payment_status
 
     return await get_user_payment_status(phone)
 
 
 def verify_webhook_signature(raw_body: bytes, signature: str) -> bool:
+    if not payments_enabled():
+        return False
+
     secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
     if not secret:
         print("Razorpay webhook secret not configured; skipping signature verification.")
@@ -117,6 +149,9 @@ def verify_webhook_signature(raw_body: bytes, signature: str) -> bool:
 
 
 def verify_callback_signature(query_params: Mapping[str, str]) -> bool:
+    if not payments_enabled():
+        return False
+
     key_secret = os.getenv("RAZORPAY_KEY_SECRET")
     if not key_secret:
         return False
@@ -142,6 +177,9 @@ def verify_callback_signature(query_params: Mapping[str, str]) -> bool:
 
 
 async def activate_subscription_from_payment_link(payment_link_id: str) -> tuple[bool, bool]:
+    if not payments_enabled():
+        return False, False
+
     from database.users import get_payment_link, mark_payment_link_paid, mark_user_as_paid
 
     payment_link = await get_payment_link(payment_link_id)
@@ -157,6 +195,9 @@ async def activate_subscription_from_payment_link(payment_link_id: str) -> tuple
 
 
 async def handle_payment_webhook(payload: dict, raw_body: bytes, signature: str) -> bool:
+    if not payments_enabled():
+        return False
+
     if not verify_webhook_signature(raw_body, signature):
         print("Invalid Razorpay webhook signature.")
         return False

@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-WHATSAPP_API_URL = "https://graph.facebook.com/v18.0"
+WHATSAPP_API_URL = "https://graph.facebook.com"
 WHATSAPP_TEXT_LIMIT = 4096
 
 
@@ -22,6 +22,11 @@ def _require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
+
+def _get_api_base_url() -> str:
+    version = os.getenv("WHATSAPP_GRAPH_API_VERSION", "v23.0").strip()
+    return f"{WHATSAPP_API_URL}/{version}"
 
 
 def _chunk_text(text: str, limit: int = WHATSAPP_TEXT_LIMIT) -> list[str]:
@@ -79,7 +84,7 @@ async def _send_single_text_message(to: str, text: str) -> dict:
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            f"{WHATSAPP_API_URL}/{phone_number_id}/messages",
+            f"{_get_api_base_url()}/{phone_number_id}/messages",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
@@ -117,7 +122,7 @@ async def send_image_url(to: str, image_url: str, caption: str = "") -> dict:
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            f"{WHATSAPP_API_URL}/{phone_number_id}/messages",
+            f"{_get_api_base_url()}/{phone_number_id}/messages",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",

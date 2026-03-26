@@ -10,6 +10,7 @@ import os
 
 import anthropic
 from dotenv import load_dotenv
+import httpx
 
 load_dotenv()
 
@@ -73,6 +74,41 @@ def _get_client() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(api_key=api_key)
 
 
+def _use_ollama() -> bool:
+    provider = os.getenv("AI_PROVIDER", "").strip().lower()
+    if provider == "ollama":
+        return True
+    return not os.getenv("ANTHROPIC_API_KEY")
+
+
+async def _explain_with_ollama(user_prompt: str) -> str:
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(f"{base_url}/api/chat", json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    message = data.get("message", {}) or {}
+    content = (message.get("content") or "").strip()
+    if not content:
+        raise RuntimeError("Ollama returned an empty response.")
+    return content
+
+
 async def explain_report_in_hindi(ocr_text: str) -> str:
     """Send OCR text to Claude and get a Hindi explanation."""
     if not ocr_text or not ocr_text.strip():
@@ -91,6 +127,11 @@ LAB REPORT TEXT:
 """
 
     try:
+        if _use_ollama():
+            explanation = await _explain_with_ollama(user_prompt)
+            print(f"Ollama generated {len(explanation)} characters")
+            return explanation
+
         client = _get_client()
         message = await client.messages.create(
             model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
@@ -113,7 +154,13 @@ LAB REPORT TEXT:
         print(f"AI configuration error: {exc}")
         return (
             "⚠️ AI service abhi configure nahi hai.\n"
-            "ANTHROPIC_API_KEY set karke dobara try karein."
+            "Anthropic key set karein ya local Ollama start karein."
+        )
+    except httpx.HTTPError as exc:
+        print(f"AI HTTP error: {exc}")
+        return (
+            "⚠️ AI service se connect nahi ho paya.\n"
+            "Agar free local mode use kar rahe hain to Ollama start karein."
         )
     except anthropic.RateLimitError:
         return "⚠️ Abhi server busy hai. 1-2 minute baad dobara report bhejein."
