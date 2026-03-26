@@ -89,6 +89,7 @@ async def health_check() -> dict[str, Any]:
     configured = {
         "whatsapp_access_token": _is_real_env_value(os.getenv("WHATSAPP_ACCESS_TOKEN")),
         "whatsapp_phone_number_id": _is_real_env_value(os.getenv("WHATSAPP_PHONE_NUMBER_ID")),
+        "openrouter_api_key": _is_real_env_value(os.getenv("OPENROUTER_API_KEY")),
         "anthropic_api_key": _is_real_env_value(os.getenv("ANTHROPIC_API_KEY")),
         "google_vision_api_key": _is_real_env_value(os.getenv("GOOGLE_VISION_API_KEY")),
         "upi_vpa": _is_real_env_value(os.getenv("UPI_VPA")),
@@ -860,6 +861,7 @@ def _is_real_env_value(value: str | None) -> bool:
         "your_key_here",
         "https://your-",
         "sk-ant-your",
+        "sk-or-v1-your_key_here",
         "aiza_your",
         "rzp_live_or_test_",
         "rzp_test_your",

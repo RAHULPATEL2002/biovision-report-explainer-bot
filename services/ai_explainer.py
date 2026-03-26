@@ -1,7 +1,7 @@
 """
 services/ai_explainer.py
 ========================
-Patient-friendly Hindi explanations powered by Claude.
+Patient-friendly Hindi explanations powered by OpenRouter, Anthropic, or Ollama.
 """
 
 from __future__ import annotations
@@ -9,61 +9,49 @@ from __future__ import annotations
 import os
 
 import anthropic
-from dotenv import load_dotenv
 import httpx
+from dotenv import load_dotenv
 
 load_dotenv()
 
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 SYSTEM_PROMPT = """
-Tum ek experienced medical educator ho jo patients ko unki lab reports
-samjhane mein madad karta hai.
+Tum BioVision ke medical AI ho. Tumhara kaam hai ki
+lab reports ko simple Hindi mein explain karo jaise
+ek dost explain kare - medical jargon bilkul nahi.
 
-Tumhara kaam:
-- Lab report ka text padho
-- Har test ka naam, value, aur normal range identify karo
-- Har test ko simple Hindi mein explain karo
-- Abnormal values clearly highlight karo
-- Patient ko samjhao ki kis cheez par dhyan dena chahiye
+Format hamesha readable aur WhatsApp-friendly rakho:
 
-Formatting rules:
-- WhatsApp friendly format use karo
-- *Bold text* ke liye asterisk use karo
-- Emojis readable aur helpful hone chahiye
-- 🔴 = high, 🟡 = borderline, 🟢 = normal, ⬇️ = low
-
-Output format:
 ━━━━━━━━━━━━━━━━━━
 🩺 *AAPKI REPORT KA SUMMARY*
 ━━━━━━━━━━━━━━━━━━
 
-📊 *IMPORTANT TESTS:*
+Har important test value ke liye:
+[EMOJI] *TEST KA NAAM*
+📌 Aapka result: [value] [unit]
+✅ Normal range: [range]
+💬 [Simple Hindi mein 2-3 lines]
 
-[Har important test ke liye]
-🔴/🟢/🟡/⬇️ *[TEST NAME]*
-📌 Aapka result: [VALUE]
-✅ Normal range: [RANGE]
-💬 Matlab: [2-3 short lines]
+Normal values ke liye 🟢
+Abnormal values ke liye 🔴
+Borderline ke liye 🟡
 
-━━━━━━━━━━━━━━━━━━
-⚠️ *DHYAN DENE WALI BAATEIN:*
-[Sirf important abnormal ya borderline values]
-
+End mein hamesha:
 ━━━━━━━━━━━━━━━━━━
 ❓ *DOCTOR SE YE SAWAL POOCHEN:*
-[3-4 useful questions]
+1. [question]
+2. [question]
+3. [question]
 
-━━━━━━━━━━━━━━━━━━
-⚕️ *DISCLAIMER:*
-Ye sirf educational information hai. Final medical advice ke liye doctor se baat karein.
+⚕️ Ye sirf educational information hai.
+Final medical advice ke liye doctor se milen.
 
 Important rules:
-- Kabhi diagnosis claim mat karo
-- Kabhi mat bolo ki patient ko koi disease pakka hai
-- Agar text unclear ho to honestly bolo
+- Diagnosis claim mat karo
 - Sirf Hindi mein jawab do
-- Maximum lagbhag 700 words
-- Sirf report ke facts explain karo, extra assumptions mat banao
+- Report ke facts se bahar assumptions mat banao
+- 700 words ke around rakho
 """
 
 
@@ -74,11 +62,25 @@ def _get_client() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(api_key=api_key)
 
 
+def _ai_provider() -> str:
+    provider = os.getenv("AI_PROVIDER", "openrouter").strip().lower()
+    if provider:
+        return provider
+    return "openrouter"
+
+
+def _use_openrouter() -> bool:
+    provider = _ai_provider()
+    if provider == "openrouter":
+        return True
+    return False
+
+
 def _use_ollama() -> bool:
-    provider = os.getenv("AI_PROVIDER", "").strip().lower()
+    provider = _ai_provider()
     if provider == "ollama":
         return True
-    return not os.getenv("ANTHROPIC_API_KEY")
+    return provider not in {"openrouter", "anthropic"} and not os.getenv("ANTHROPIC_API_KEY")
 
 
 async def _explain_with_ollama(user_prompt: str) -> str:
@@ -92,9 +94,7 @@ async def _explain_with_ollama(user_prompt: str) -> str:
             {"role": "user", "content": user_prompt},
         ],
         "stream": False,
-        "options": {
-            "temperature": 0.2,
-        },
+        "options": {"temperature": 0.2},
     }
 
     async with httpx.AsyncClient(timeout=120) as client:
@@ -109,8 +109,41 @@ async def _explain_with_ollama(user_prompt: str) -> str:
     return content
 
 
+async def _explain_with_openrouter(user_prompt: str) -> str:
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing required environment variable: OPENROUTER_API_KEY")
+
+    model = os.getenv("AI_MODEL", "openrouter/free").strip()
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.getenv("APP_URL", "https://biovision.app"),
+        "X-Title": "BioVision Lab Report Bot",
+    }
+    payload = {
+        "model": model,
+        "max_tokens": 2048,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    content = data["choices"][0]["message"]["content"].strip()
+    if not content:
+        raise RuntimeError("OpenRouter returned an empty response.")
+    return content
+
+
 async def explain_report_in_hindi(ocr_text: str) -> str:
-    """Send OCR text to Claude and get a Hindi explanation."""
+    """Send OCR text to the configured AI provider and get a Hindi explanation."""
     if not ocr_text or not ocr_text.strip():
         return "⚠️ Report text mil nahi paya. Kripya clear photo ya PDF dobara bhejein."
 
@@ -127,6 +160,11 @@ LAB REPORT TEXT:
 """
 
     try:
+        if _use_openrouter():
+            explanation = await _explain_with_openrouter(user_prompt)
+            print(f"OpenRouter generated {len(explanation)} characters")
+            return explanation
+
         if _use_ollama():
             explanation = await _explain_with_ollama(user_prompt)
             print(f"Ollama generated {len(explanation)} characters")
@@ -147,21 +185,21 @@ LAB REPORT TEXT:
                 explanation += block.text
 
         explanation = explanation.strip()
-        print(f"AI generated {len(explanation)} characters")
+        print(f"Anthropic generated {len(explanation)} characters")
         return explanation or "⚠️ AI response empty aaya. Kripya dobara try karein."
 
     except RuntimeError as exc:
         print(f"AI configuration error: {exc}")
         return (
             "⚠️ AI service abhi configure nahi hai.\n"
-            "Anthropic key set karein ya local Ollama start karein."
+            "OpenRouter key, Anthropic key, ya local Ollama configure karein."
         )
+    except httpx.HTTPStatusError as exc:
+        print(f"AI HTTP status error: {exc.response.status_code} - {exc.response.text}")
+        return "⚠️ AI service se error aaya. Thodi der baad dobara try karein."
     except httpx.HTTPError as exc:
         print(f"AI HTTP error: {exc}")
-        return (
-            "⚠️ AI service se connect nahi ho paya.\n"
-            "Agar free local mode use kar rahe hain to Ollama start karein."
-        )
+        return "⚠️ AI service se connect nahi ho paya. Thodi der baad dobara try karein."
     except anthropic.RateLimitError:
         return "⚠️ Abhi server busy hai. 1-2 minute baad dobara report bhejein."
     except anthropic.APIError as exc:
