@@ -1,15 +1,16 @@
 # BioVision WhatsApp Bot
 
-BioVision WhatsApp Bot helps users understand blood test and lab reports in simple Hindi or English using FastAPI, OpenRouter or Claude AI, OCR, WhatsApp Cloud API, and direct UPI or Razorpay payment flows.
+BioVision WhatsApp Bot helps users understand blood test and lab reports in simple Hindi or English using FastAPI, OpenRouter or Claude AI, OCR, and either Evolution API or WhatsApp Cloud API, plus direct UPI or Razorpay payment flows.
 
 ## Features
 
-- WhatsApp webhook integration with Meta WhatsApp Cloud API
+- WhatsApp webhook integration with Evolution API or Meta WhatsApp Cloud API
 - Hindi and English lab report explanations powered by OpenRouter, Anthropic, or Ollama
 - OCR support for report images and PDFs through OCR.Space, Google Vision, or Tesseract
 - Free trial with paid report unlock flow
 - Direct UPI payment link and QR flow with admin approval
 - Report history stored in SQLite
+- Dockerfile included for VM / EasyPanel style deployment
 
 ## Tech Stack
 
@@ -17,7 +18,7 @@ BioVision WhatsApp Bot helps users understand blood test and lab reports in simp
 - FastAPI
 - OpenRouter / Anthropic / Ollama
 - OCR.Space / Google Vision / Tesseract OCR
-- WhatsApp Cloud API
+- Evolution API / WhatsApp Cloud API
 - UPI / Razorpay
 - SQLite
 
@@ -40,9 +41,9 @@ Open:
 
 Create a `.env` file from `.env.example` and fill in:
 
-- `WHATSAPP_ACCESS_TOKEN`
-- `WHATSAPP_PHONE_NUMBER_ID`
-- `WHATSAPP_VERIFY_TOKEN`
+- `WHATSAPP_PROVIDER`
+- `EVOLUTION_API_URL` / `EVOLUTION_API_KEY` / `EVOLUTION_INSTANCE_NAME`
+- or `WHATSAPP_ACCESS_TOKEN` / `WHATSAPP_PHONE_NUMBER_ID` / `WHATSAPP_VERIFY_TOKEN`
 - `OPENROUTER_API_KEY`
 - `OCR_SPACE_API_KEY` or `GOOGLE_VISION_API_KEY`
 - `UPI_VPA`
@@ -52,7 +53,7 @@ Create a `.env` file from `.env.example` and fill in:
 
 ## Deployment
 
-This project is ready to deploy on Railway using `railway.toml`.
+This project can be deployed on Railway using `railway.toml`, or on a VM / EasyPanel using the included `Dockerfile`.
 
 ## Notes
 

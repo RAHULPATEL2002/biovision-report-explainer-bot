@@ -10,6 +10,7 @@ import base64
 import os
 import subprocess
 import tempfile
+from urllib.parse import unquote_to_bytes
 
 import fitz
 import httpx
@@ -71,12 +72,25 @@ def _ocr_with_tesseract_bytes(image_bytes: bytes, suffix: str = ".png") -> str:
 
 
 async def _download_whatsapp_media(media_url: str) -> bytes:
-    token = _require_env("WHATSAPP_ACCESS_TOKEN")
+    if media_url.startswith("data:"):
+        _, encoded = media_url.split(",", 1)
+        if ";base64" in media_url[: media_url.find(",")]:
+            return base64.b64decode(encoded)
+        return unquote_to_bytes(encoded)
+
+    headers: dict[str, str] = {}
+    provider = os.getenv("WHATSAPP_PROVIDER", "meta").strip().lower()
+    if provider == "meta":
+        token = _require_env("WHATSAPP_ACCESS_TOKEN")
+        headers["Authorization"] = f"Bearer {token}"
+    elif provider == "evolution":
+        evolution_api_url = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
+        evolution_api_key = os.getenv("EVOLUTION_API_KEY", "").strip()
+        if evolution_api_url and evolution_api_key and media_url.startswith(evolution_api_url):
+            headers["apikey"] = evolution_api_key
+
     async with httpx.AsyncClient(timeout=45) as client:
-        response = await client.get(
-            media_url,
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        response = await client.get(media_url, headers=headers)
         response.raise_for_status()
         return response.content
 

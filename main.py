@@ -87,9 +87,14 @@ async def root() -> dict[str, str]:
 @app.get("/health")
 async def health_check() -> dict[str, Any]:
     provider = payment_provider()
+    whatsapp_provider = os.getenv("WHATSAPP_PROVIDER", "meta").strip().lower() or "meta"
     configured = {
+        "whatsapp_provider": whatsapp_provider,
         "whatsapp_access_token": _is_real_env_value(os.getenv("WHATSAPP_ACCESS_TOKEN")),
         "whatsapp_phone_number_id": _is_real_env_value(os.getenv("WHATSAPP_PHONE_NUMBER_ID")),
+        "evolution_api_url": _is_real_env_value(os.getenv("EVOLUTION_API_URL")),
+        "evolution_api_key": _is_real_env_value(os.getenv("EVOLUTION_API_KEY")),
+        "evolution_instance_name": _is_real_env_value(os.getenv("EVOLUTION_INSTANCE_NAME")),
         "openrouter_api_key": _is_real_env_value(os.getenv("OPENROUTER_API_KEY")),
         "anthropic_api_key": _is_real_env_value(os.getenv("ANTHROPIC_API_KEY")),
         "google_vision_api_key": _is_real_env_value(os.getenv("GOOGLE_VISION_API_KEY")),
@@ -101,6 +106,13 @@ async def health_check() -> dict[str, Any]:
         "app_url": _is_real_env_value(os.getenv("APP_URL")),
         "admin_api_key": _is_real_env_value(os.getenv("ADMIN_API_KEY")),
     }
+    whatsapp_ready = (
+        configured["evolution_api_url"]
+        and configured["evolution_api_key"]
+        and configured["evolution_instance_name"]
+        if whatsapp_provider == "evolution"
+        else configured["whatsapp_access_token"] and configured["whatsapp_phone_number_id"]
+    )
     return {
         "status": "ok",
         "verify_token_configured": bool(os.getenv("WHATSAPP_VERIFY_TOKEN")),
@@ -109,6 +121,7 @@ async def health_check() -> dict[str, Any]:
         "queued_background_tasks": len(getattr(app.state, "background_tasks", set())),
         "payment_provider": provider,
         "payments_enabled": payments_enabled(),
+        "whatsapp_ready": whatsapp_ready,
         "services": configured,
     }
 
@@ -1516,3 +1529,363 @@ def get_follow_up_message(
         f"{plan_line}\n"
         "Send `history` to view your saved reports.",
     )
+
+
+def _whatsapp_provider() -> str:
+    provider = os.getenv("WHATSAPP_PROVIDER", "meta").strip().lower()
+    return provider or "meta"
+
+
+def _extract_phone_from_remote_jid(remote_jid: str) -> str:
+    value = (remote_jid or "").strip()
+    if not value or value == "status@broadcast" or value.endswith("@g.us"):
+        return ""
+    local_part = value.split("@", 1)[0]
+    digits = "".join(character for character in local_part if character.isdigit())
+    return digits or local_part
+
+
+def _unwrap_evolution_message(message: dict[str, Any]) -> dict[str, Any]:
+    current = message or {}
+    while isinstance(current, dict):
+        for wrapper in (
+            "ephemeralMessage",
+            "viewOnceMessage",
+            "viewOnceMessageV2",
+            "viewOnceMessageV2Extension",
+            "documentWithCaptionMessage",
+        ):
+            payload = current.get(wrapper)
+            if isinstance(payload, dict):
+                nested = payload.get("message")
+                if isinstance(nested, dict):
+                    current = nested
+                    break
+        else:
+            return current
+    return {}
+
+
+def _extract_evolution_text(message: dict[str, Any]) -> str:
+    current = _unwrap_evolution_message(message)
+    if current.get("conversation"):
+        return str(current["conversation"])
+    extended = current.get("extendedTextMessage", {})
+    if isinstance(extended, dict) and extended.get("text"):
+        return str(extended["text"])
+    image = current.get("imageMessage", {})
+    if isinstance(image, dict) and image.get("caption"):
+        return str(image["caption"])
+    document = current.get("documentMessage", {})
+    if isinstance(document, dict) and document.get("caption"):
+        return str(document["caption"])
+    return ""
+
+
+def _detect_evolution_message_type(message: dict[str, Any]) -> str:
+    current = _unwrap_evolution_message(message)
+    if current.get("conversation") or (isinstance(current.get("extendedTextMessage"), dict) and current["extendedTextMessage"].get("text")):
+        return "text"
+    if isinstance(current.get("imageMessage"), dict):
+        return "image"
+    if isinstance(current.get("documentMessage"), dict):
+        return "document"
+    return ""
+
+
+def _find_evolution_media_url(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("mediaUrl", "mediaURL", "url"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.startswith(("http://", "https://", "data:")):
+                return value
+        for value in payload.values():
+            found = _find_evolution_media_url(value)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _find_evolution_media_url(value)
+            if found:
+                return found
+    return ""
+
+
+async def _get_evolution_media_data_uri(message_object: dict[str, Any], mime_type: str = "") -> str:
+    api_url = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
+    api_key = os.getenv("EVOLUTION_API_KEY", "").strip()
+    instance_name = os.getenv("EVOLUTION_INSTANCE_NAME", "").strip()
+
+    if not api_url or not api_key or not instance_name:
+        raise RuntimeError("Missing Evolution API configuration for media fetch.")
+
+    payload = {"message": message_object}
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            f"{api_url}/chat/getBase64FromMediaMessage/{instance_name}",
+            headers={"apikey": api_key, "Content-Type": "application/json"},
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    base64_value = (data.get("base64") or "").strip()
+    if not base64_value:
+        raise RuntimeError("Evolution API returned empty media payload.")
+
+    resolved_mime = (data.get("mimetype") or mime_type or "application/octet-stream").strip()
+    return f"data:{resolved_mime};base64,{base64_value}"
+
+
+def extract_message_payloads(body: dict) -> list[dict[str, Any]]:
+    if body.get("event") == "messages.upsert" and isinstance(body.get("data"), dict):
+        event_data = body["data"]
+        key = event_data.get("key", {}) or {}
+        if key.get("fromMe"):
+            return []
+
+        phone = _extract_phone_from_remote_jid(str(key.get("remoteJid", "")))
+        if not phone:
+            return []
+
+        message = event_data.get("message", {}) or {}
+        message_type = _detect_evolution_message_type(message)
+        if not message_type:
+            return []
+
+        payload: dict[str, Any] = {
+            "from": phone,
+            "type": message_type,
+            "name": (event_data.get("pushName") or "").strip(),
+            "source_provider": "evolution",
+            "message_object": event_data,
+            "media_url": _find_evolution_media_url(message) or _find_evolution_media_url(event_data),
+        }
+
+        if message_type == "text":
+            payload["text"] = _extract_evolution_text(message)
+        elif message_type == "document":
+            document_message = _unwrap_evolution_message(message).get("documentMessage", {}) or {}
+            payload["mime_type"] = document_message.get("mimetype", "")
+        elif message_type == "image":
+            image_message = _unwrap_evolution_message(message).get("imageMessage", {}) or {}
+            payload["mime_type"] = image_message.get("mimetype", "")
+
+        return [payload]
+
+    payloads: list[dict[str, Any]] = []
+    for entry in body.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            messages = value.get("messages", []) or []
+            contacts = value.get("contacts", []) or []
+            contact_name = ""
+            if contacts:
+                contact_name = contacts[0].get("profile", {}).get("name", "").strip()
+
+            for message in messages:
+                message_type = message.get("type")
+                payload: dict[str, Any] = {
+                    "from": message.get("from", ""),
+                    "type": message_type,
+                    "name": contact_name,
+                    "source_provider": "meta",
+                }
+
+                if message_type == "text":
+                    payload["text"] = message.get("text", {}).get("body", "")
+                elif message_type == "image":
+                    payload["media_id"] = message.get("image", {}).get("id", "")
+                elif message_type == "document":
+                    payload["media_id"] = message.get("document", {}).get("id", "")
+                    payload["mime_type"] = message.get("document", {}).get("mime_type", "")
+
+                if payload.get("from") and payload.get("type"):
+                    payloads.append(payload)
+
+    return payloads
+
+
+async def get_whatsapp_media_url(message_data: dict[str, Any]) -> str:
+    source_provider = message_data.get("source_provider") or _whatsapp_provider()
+    if source_provider == "evolution":
+        media_url = (message_data.get("media_url") or "").strip()
+        if media_url:
+            return media_url
+
+        message_object = message_data.get("message_object")
+        if not isinstance(message_object, dict):
+            raise RuntimeError("Evolution API media payload missing message object.")
+
+        return await _get_evolution_media_data_uri(message_object, str(message_data.get("mime_type", "")))
+
+    media_id = str(message_data.get("media_id", "")).strip()
+    token = os.getenv("WHATSAPP_ACCESS_TOKEN")
+    if not token:
+        raise RuntimeError("Missing required environment variable: WHATSAPP_ACCESS_TOKEN")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{media_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    media_url = data.get("url")
+    if not media_url:
+        raise RuntimeError("WhatsApp media URL missing in response.")
+    return media_url
+
+
+async def process_message_job(message_data: dict[str, Any]) -> None:
+    app.state.active_jobs += 1
+
+    try:
+        phone = message_data["from"]
+        contact_name = message_data.get("name", "")
+        message_type = message_data["type"]
+
+        user = await get_or_create_user(phone, contact_name)
+        report_count = await get_user_report_count(phone)
+        subscription_paid = await is_user_paid(phone)
+        paid_credits = await get_user_paid_credits(phone)
+        payments_on = payments_enabled()
+
+        if message_type == "text":
+            incoming_text = message_data.get("text", "").strip()
+            await handle_text(phone, incoming_text, user, report_count, subscription_paid, paid_credits, payments_on)
+        elif message_type == "image":
+            async with app.state.media_processing_semaphore:
+                await handle_media(
+                    phone,
+                    message_data,
+                    user,
+                    report_count,
+                    subscription_paid,
+                    paid_credits,
+                    payments_on,
+                )
+        elif message_type == "document":
+            mime_type = message_data.get("mime_type", "")
+            if "pdf" not in mime_type.lower():
+                await safe_send_text(
+                    phone,
+                    _text(
+                        _get_user_language(user),
+                        "❌ Abhi sirf report ki photo ya PDF support hoti hai. Kripya wahi bhejein.",
+                        "❌ Only report images and PDFs are supported right now. Please send one of those.",
+                    ),
+                )
+            else:
+                async with app.state.media_processing_semaphore:
+                    await handle_media(
+                        phone,
+                        message_data,
+                        user,
+                        report_count,
+                        subscription_paid,
+                        paid_credits,
+                        payments_on,
+                    )
+        else:
+            await safe_send_text(
+                phone,
+                _text(
+                    _get_user_language(user),
+                    "📎 Is type ka message abhi support nahi hai.\nPhoto, PDF, ya text message bhejiye.",
+                    "📎 This message type is not supported yet.\nPlease send a photo, PDF, or text message.",
+                ),
+            )
+    except Exception as exc:
+        print(f"Background message processing error: {exc}")
+    finally:
+        app.state.active_jobs = max(0, app.state.active_jobs - 1)
+
+
+async def handle_media(
+    phone: str,
+    message_data: dict[str, Any],
+    user: dict,
+    report_count: int,
+    subscription_paid: bool,
+    paid_credits: int,
+    payments_on: bool,
+) -> None:
+    language = _get_user_language(user)
+    if not language:
+        await safe_send_text(phone, get_language_prompt(user.get("name", "")))
+        return
+
+    if not await user_can_submit_report(report_count, subscription_paid, paid_credits, payments_on):
+        await send_upi_payment_prompt(phone, report_count, paid_credits, payments_on, language)
+        return
+
+    await safe_send_text(
+        phone,
+        _text(
+            language,
+            "⏳ *Report process ho rahi hai...*\nPlease 30-60 seconds wait karein.\n\nAI aapki report padh raha hai.",
+            "⏳ *Your report is being processed...*\nPlease wait for 30-60 seconds.\n\nOur AI is reading your report.",
+        ),
+    )
+
+    try:
+        media_source = await get_whatsapp_media_url(message_data)
+        if message_data["type"] == "image":
+            extracted_text = await extract_text_from_image_url(media_source)
+        else:
+            extracted_text = await extract_text_from_pdf_url(media_source)
+
+        if len(extracted_text.strip()) < 50:
+            await safe_send_text(
+                phone,
+                _text(
+                    language,
+                    "❌ Report clearly read nahi ho payi.\n\nDobara bhejte waqt dhyan dein:\n• photo seedhi aur clear ho\n• poori report frame mein ho\n• roshni achhi ho",
+                    "❌ We could not clearly read the report.\n\nPlease try again and make sure:\n• the image is straight and clear\n• the full report is visible\n• the lighting is good",
+                ),
+            )
+            return
+
+        explanation = await explain_report_in_hindi(extracted_text, language=language)
+        explanation_sent = await safe_send_text(phone, explanation)
+
+        if explanation.startswith("⚠️"):
+            return
+
+        if not explanation_sent:
+            print(f"Skipping report save for {phone} because explanation delivery failed.")
+            return
+
+        await save_report(phone, extracted_text, explanation)
+        await increment_report_count(phone)
+
+        used_paid_credit = False
+        if payments_on and report_count >= FREE_REPORT_LIMIT and not subscription_paid:
+            used_paid_credit = await consume_user_paid_credit(phone)
+
+        new_count = report_count + 1
+        remaining = max(FREE_REPORT_LIMIT - new_count, 0)
+        credits_left = await get_user_paid_credits(phone)
+        await safe_send_text(
+            phone,
+            get_follow_up_message(
+                remaining,
+                subscription_paid,
+                payments_on,
+                used_paid_credit,
+                credits_left,
+                language,
+            ),
+        )
+    except Exception as exc:
+        print(f"Media processing error: {exc}")
+        await safe_send_text(
+            phone,
+            _text(
+                language,
+                "⚠️ Report process karte waqt error aaya.\nThodi der baad dobara try karein. Agar issue repeat ho to support se contact karein.",
+                "⚠️ There was an error while processing your report.\nPlease try again after a short while. If the issue continues, contact support.",
+            ),
+        )
