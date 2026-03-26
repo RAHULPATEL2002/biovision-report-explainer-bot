@@ -15,17 +15,25 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from database.users import (
+    approve_upi_payment,
+    consume_user_paid_credit,
+    get_latest_open_upi_payment,
     get_or_create_user,
+    get_pending_upi_payments,
+    get_upi_payment_by_ref,
+    get_user_paid_credits,
     get_user_report_count,
     get_user_reports,
     get_user_subscription_details,
     increment_report_count,
     init_db,
+    reject_upi_payment,
     save_report,
+    submit_upi_payment_utr,
 )
 from services.ai_explainer import explain_report_in_hindi
 from services.ocr import extract_text_from_image_url, extract_text_from_pdf_url
@@ -34,10 +42,17 @@ from services.payment import (
     create_payment_link,
     handle_payment_webhook,
     is_user_paid,
+    payment_provider,
     payments_enabled,
     verify_callback_signature,
 )
-from services.whatsapp import send_text_message
+from services.upi import (
+    get_or_create_upi_request,
+    get_report_price_inr,
+    get_upi_qr_png_bytes,
+    upi_manual_enabled,
+)
+from services.whatsapp import send_image_url, send_text_message
 
 load_dotenv()
 
@@ -70,16 +85,18 @@ async def root() -> dict[str, str]:
 
 @app.get("/health")
 async def health_check() -> dict[str, Any]:
+    provider = payment_provider()
     configured = {
         "whatsapp_access_token": _is_real_env_value(os.getenv("WHATSAPP_ACCESS_TOKEN")),
         "whatsapp_phone_number_id": _is_real_env_value(os.getenv("WHATSAPP_PHONE_NUMBER_ID")),
         "anthropic_api_key": _is_real_env_value(os.getenv("ANTHROPIC_API_KEY")),
         "google_vision_api_key": _is_real_env_value(os.getenv("GOOGLE_VISION_API_KEY")),
+        "upi_vpa": _is_real_env_value(os.getenv("UPI_VPA")),
+        "upi_payee_name": _is_real_env_value(os.getenv("UPI_PAYEE_NAME")),
         "razorpay_key_id": _is_real_env_value(os.getenv("RAZORPAY_KEY_ID")),
         "razorpay_key_secret": _is_real_env_value(os.getenv("RAZORPAY_KEY_SECRET")),
-        "razorpay_webhook_secret": _is_real_env_value(os.getenv("RAZORPAY_WEBHOOK_SECRET")),
         "app_url": _is_real_env_value(os.getenv("APP_URL")),
-        "payments_enabled": payments_enabled(),
+        "admin_api_key": _is_real_env_value(os.getenv("ADMIN_API_KEY")),
     }
     return {
         "status": "ok",
@@ -87,6 +104,8 @@ async def health_check() -> dict[str, Any]:
         "processing_concurrency": PROCESSING_CONCURRENCY,
         "active_jobs": getattr(app.state, "active_jobs", 0),
         "queued_background_tasks": len(getattr(app.state, "background_tasks", set())),
+        "payment_provider": provider,
+        "payments_enabled": payments_enabled(),
         "services": configured,
     }
 
@@ -112,15 +131,15 @@ async def receive_message(request: Request) -> dict[str, Any]:
         for message_data in messages:
             _spawn_background_task(process_message_job(message_data))
 
+        return {"status": "accepted", "queued_messages": len(messages)}
     except Exception as exc:
         print(f"Webhook processing error: {exc}")
-
-    return {"status": "accepted", "queued_messages": len(messages)}
+        return {"status": "error"}
 
 
 @app.post("/payments/razorpay/webhook")
 async def razorpay_webhook(request: Request) -> dict[str, bool]:
-    if not payments_enabled():
+    if payment_provider() != "razorpay" or not payments_enabled():
         return {"processed": False}
 
     raw_body = await request.body()
@@ -137,11 +156,11 @@ async def razorpay_webhook(request: Request) -> dict[str, bool]:
 
 @app.get("/payment-success", response_class=HTMLResponse)
 async def payment_success(request: Request) -> HTMLResponse:
-    if not payments_enabled():
+    if payment_provider() != "razorpay" or not payments_enabled():
         return HTMLResponse(
             content=_payment_page_html(
                 "Payments Disabled",
-                "Is deployment mein payments disabled hain.",
+                "Is deployment mein Razorpay payment callback active nahi hai.",
             ),
             status_code=200,
         )
@@ -187,6 +206,61 @@ async def payment_success(request: Request) -> HTMLResponse:
     )
 
 
+@app.get("/payments/upi/qr/{payment_ref}.png")
+async def upi_payment_qr(payment_ref: str) -> StreamingResponse:
+    payment = await get_upi_payment_by_ref(payment_ref)
+    if not payment or not payment.get("upi_uri"):
+        raise HTTPException(status_code=404, detail="Payment request not found.")
+
+    png_bytes = get_upi_qr_png_bytes(payment["upi_uri"])
+    return StreamingResponse(iter([png_bytes]), media_type="image/png")
+
+
+@app.get("/admin/upi/pending")
+async def admin_list_pending_payments(x_admin_key: str = Header(default="")) -> dict[str, Any]:
+    _assert_admin_key(x_admin_key)
+    payments = await get_pending_upi_payments()
+    return {"pending_payments": payments}
+
+
+@app.post("/admin/upi/{payment_ref}/approve")
+async def admin_approve_payment(
+    payment_ref: str,
+    credits: int = 1,
+    x_admin_key: str = Header(default=""),
+) -> dict[str, Any]:
+    _assert_admin_key(x_admin_key)
+    payment = await approve_upi_payment(payment_ref, max(1, credits))
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+
+    await safe_send_text(
+        payment["phone"],
+        "✅ Payment verify ho gaya.\n"
+        f"Aapke account mein {payment.get('approved_credits', 1)} paid report credit add ho gaya hai.\n"
+        "Ab apni report ki photo ya PDF bhejiye.",
+    )
+    return {"approved_payment": payment}
+
+
+@app.post("/admin/upi/{payment_ref}/reject")
+async def admin_reject_payment(
+    payment_ref: str,
+    x_admin_key: str = Header(default=""),
+) -> dict[str, Any]:
+    _assert_admin_key(x_admin_key)
+    payment = await reject_upi_payment(payment_ref)
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+
+    await safe_send_text(
+        payment["phone"],
+        "⚠️ Payment verification complete nahi ho payi.\n"
+        "Kripya sahi UTR ke saath dobara `paid <UTR>` bhejiye ya support se contact karein.",
+    )
+    return {"rejected_payment": payment}
+
+
 def _spawn_background_task(coro: Any) -> None:
     task = asyncio.create_task(coro)
     app.state.background_tasks.add(task)
@@ -203,15 +277,25 @@ async def process_message_job(message_data: dict[str, Any]) -> None:
 
         user = await get_or_create_user(phone, contact_name)
         report_count = await get_user_report_count(phone)
-        paid = await is_user_paid(phone)
+        subscription_paid = await is_user_paid(phone)
+        paid_credits = await get_user_paid_credits(phone)
         payments_on = payments_enabled()
 
         if message_type == "text":
-            incoming_text = message_data.get("text", "").strip().lower()
-            await handle_text(phone, incoming_text, user, report_count, paid, payments_on)
+            incoming_text = message_data.get("text", "").strip()
+            await handle_text(phone, incoming_text, user, report_count, subscription_paid, paid_credits, payments_on)
         elif message_type == "image":
             async with app.state.media_processing_semaphore:
-                await handle_media(phone, message_data["media_id"], "image", user, report_count, paid, payments_on)
+                await handle_media(
+                    phone,
+                    message_data["media_id"],
+                    "image",
+                    user,
+                    report_count,
+                    subscription_paid,
+                    paid_credits,
+                    payments_on,
+                )
         elif message_type == "document":
             mime_type = message_data.get("mime_type", "")
             if "pdf" not in mime_type.lower():
@@ -221,7 +305,16 @@ async def process_message_job(message_data: dict[str, Any]) -> None:
                 )
             else:
                 async with app.state.media_processing_semaphore:
-                    await handle_media(phone, message_data["media_id"], "pdf", user, report_count, paid, payments_on)
+                    await handle_media(
+                        phone,
+                        message_data["media_id"],
+                        "pdf",
+                        user,
+                        report_count,
+                        subscription_paid,
+                        paid_credits,
+                        payments_on,
+                    )
         else:
             await safe_send_text(
                 phone,
@@ -239,48 +332,50 @@ async def handle_text(
     text: str,
     user: dict,
     report_count: int,
-    paid: bool,
+    subscription_paid: bool,
+    paid_credits: int,
     payments_on: bool,
 ) -> None:
-    if _matches_any(text, ["hi", "hello", "helo", "hey", "start", "menu", "help", "namaste"]):
+    lower_text = text.strip().lower()
+
+    if _matches_any(lower_text, ["hi", "hello", "helo", "hey", "start", "menu", "help", "namaste"]):
         await safe_send_text(
             phone,
-            get_welcome_message(user.get("name", ""), report_count, paid, payments_on),
+            get_welcome_message(user.get("name", ""), report_count, subscription_paid, paid_credits, payments_on),
         )
         return
 
-    if _matches_any(text, ["kaise", "how", "use", "steps", "guide"]):
+    if _matches_any(lower_text, ["kaise", "how", "use", "steps", "guide"]):
         await safe_send_text(phone, get_how_to_use())
         return
 
-    if _matches_any(text, ["price", "pricing", "cost", "kitna"]):
+    if lower_text.startswith("paid ") or lower_text.startswith("utr "):
+        utr = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+        await safe_send_text(phone, await handle_payment_proof_submission(phone, utr))
+        return
+
+    if _matches_any(lower_text, ["price", "pricing", "cost", "kitna"]):
         await safe_send_text(phone, get_pricing_message(payments_on))
         return
 
-    if _matches_any(text, ["pay", "premium", "subscription", "subscribe", "unlock"]):
-        await safe_send_text(
-            phone,
-            await get_payment_required_message(phone, user.get("name", ""), payments_on),
-        )
+    if _matches_any(lower_text, ["pay", "premium", "subscription", "subscribe", "unlock"]):
+        await send_upi_payment_prompt(phone, report_count, paid_credits, payments_on)
         return
 
-    if _matches_any(text, ["history", "reports", "past report", "old report"]):
+    if _matches_any(lower_text, ["history", "reports", "past report", "old report"]):
         await safe_send_text(phone, await get_history_message(phone))
         return
 
-    if _matches_any(text, ["status", "plan", "trial", "remaining", "balance"]):
+    if _matches_any(lower_text, ["status", "plan", "trial", "remaining", "balance", "credit"]):
         await safe_send_text(phone, await get_status_message(phone))
         return
 
-    if not payments_on or report_count < FREE_REPORT_LIMIT or paid:
+    if await user_can_submit_report(report_count, subscription_paid, paid_credits, payments_on):
         remaining = max(FREE_REPORT_LIMIT - report_count, 0)
-        await safe_send_text(phone, get_report_prompt(remaining, paid, payments_on))
+        await safe_send_text(phone, get_report_prompt(remaining, subscription_paid, paid_credits, payments_on))
         return
 
-    await safe_send_text(
-        phone,
-        await get_payment_required_message(phone, user.get("name", ""), payments_on),
-    )
+    await send_upi_payment_prompt(phone, report_count, paid_credits, payments_on)
 
 
 async def handle_media(
@@ -289,14 +384,12 @@ async def handle_media(
     media_type: str,
     user: dict,
     report_count: int,
-    paid: bool,
+    subscription_paid: bool,
+    paid_credits: int,
     payments_on: bool,
 ) -> None:
-    if payments_on and report_count >= FREE_REPORT_LIMIT and not paid:
-        await safe_send_text(
-            phone,
-            await get_payment_required_message(phone, user.get("name", ""), payments_on),
-        )
+    if not await user_can_submit_report(report_count, subscription_paid, paid_credits, payments_on):
+        await send_upi_payment_prompt(phone, report_count, paid_credits, payments_on)
         return
 
     await safe_send_text(
@@ -337,9 +430,17 @@ async def handle_media(
         await save_report(phone, extracted_text, explanation)
         await increment_report_count(phone)
 
+        used_paid_credit = False
+        if payments_on and report_count >= FREE_REPORT_LIMIT and not subscription_paid:
+            used_paid_credit = await consume_user_paid_credit(phone)
+
         new_count = report_count + 1
         remaining = max(FREE_REPORT_LIMIT - new_count, 0)
-        await safe_send_text(phone, get_follow_up_message(remaining, paid, payments_on))
+        credits_left = await get_user_paid_credits(phone)
+        await safe_send_text(
+            phone,
+            get_follow_up_message(remaining, subscription_paid, payments_on, used_paid_credit, credits_left),
+        )
 
     except Exception as exc:
         print(f"Media processing error: {exc}")
@@ -350,12 +451,110 @@ async def handle_media(
         )
 
 
+async def send_upi_payment_prompt(
+    phone: str,
+    report_count: int,
+    paid_credits: int,
+    payments_on: bool,
+) -> None:
+    if not payments_on:
+        await safe_send_text(
+            phone,
+            "✅ Is build mein payments disabled hain.\nSeedha apni report ki photo ya PDF bhejiye.",
+        )
+        return
+
+    if payment_provider() == "razorpay":
+        await safe_send_text(phone, await get_razorpay_payment_message(phone))
+        return
+
+    if not upi_manual_enabled():
+        await safe_send_text(
+            phone,
+            "⚠️ Payment system abhi configure nahi hai. Support se contact karein.",
+        )
+        return
+
+    payment_request = await get_or_create_upi_request(phone)
+    price = payment_request.get("amount_inr", get_report_price_inr())
+    payment_ref = payment_request["payment_ref"]
+    upi_uri = payment_request["upi_uri"]
+    payee_name = os.getenv("UPI_PAYEE_NAME", "BioVision")
+    qr_url = _upi_qr_url(payment_ref)
+
+    message = (
+        f"💳 *Report unlock payment*\n\n"
+        f"Ek paid report ke liye *₹{price}* pay kariye.\n"
+        f"UPI ID: *{os.getenv('UPI_VPA', '')}*\n"
+        f"Payee: *{payee_name}*\n"
+        f"Ref: *{payment_ref}*\n\n"
+        f"Tap to pay:\n{upi_uri}\n\n"
+        "Payment ke baad yahin reply kariye:\n"
+        f"`paid YOUR_UTR`\n\n"
+        f"Agar UTR nahi pata ho to apne UPI app mein transaction reference dekhiye."
+    )
+    await safe_send_text(phone, message)
+
+    if qr_url:
+        await safe_send_image(
+            phone,
+            qr_url,
+            f"QR scan karke ₹{price} pay karein. Payment ke baad `paid YOUR_UTR` bhejiye.",
+        )
+
+    if report_count >= FREE_REPORT_LIMIT:
+        await safe_send_text(
+            phone,
+            f"Aapke free reports use ho chuke hain. Paid credits available: {paid_credits}",
+        )
+
+
+async def handle_payment_proof_submission(phone: str, utr: str) -> str:
+    if not utr:
+        return "⚠️ UTR missing hai. Example: `paid 123456789012`"
+
+    payment = await submit_upi_payment_utr(phone, utr)
+    if not payment:
+        return "⚠️ Koi pending payment request nahi mili. Pehle `pay` bhejiye."
+
+    return (
+        "✅ Payment proof receive ho gaya.\n"
+        f"Ref: {payment['payment_ref']}\n"
+        "Team verification ke baad aapko WhatsApp par credit mil jayega.\n"
+        "Usually yeh kuch minutes mein ho jana chahiye."
+    )
+
+
+async def user_can_submit_report(
+    report_count: int,
+    subscription_paid: bool,
+    paid_credits: int,
+    payments_on: bool,
+) -> bool:
+    if report_count < FREE_REPORT_LIMIT:
+        return True
+    if subscription_paid:
+        return True
+    if payments_on and paid_credits > 0:
+        return True
+    return not payments_on
+
+
 async def safe_send_text(phone: str, text: str) -> bool:
     try:
         await send_text_message(phone, text)
         return True
     except Exception as exc:
         print(f"Unable to send WhatsApp message to {phone}: {exc}")
+        return False
+
+
+async def safe_send_image(phone: str, image_url: str, caption: str = "") -> bool:
+    try:
+        await send_image_url(phone, image_url, caption)
+        return True
+    except Exception as exc:
+        print(f"Unable to send WhatsApp image to {phone}: {exc}")
         return False
 
 
@@ -411,66 +610,45 @@ def extract_message_payloads(body: dict) -> list[dict[str, Any]]:
     return payloads
 
 
-def _matches_any(text: str, keywords: list[str]) -> bool:
-    return any(keyword in text for keyword in keywords)
-
-
-def _is_real_env_value(value: str | None) -> bool:
-    if not value:
-        return False
-
-    lowered = value.strip().lower()
-    placeholder_markers = [
-        "your_",
-        "your_key_here",
-        "https://your-",
-        "sk-ant-your",
-        "aiza_your",
-        "rzp_live_or_test_",
-        "rzp_test_your",
-    ]
-    return not any(marker in lowered for marker in placeholder_markers)
-
-
 def get_pricing_message(payments_on: bool) -> str:
     if not payments_on:
         return (
             "💰 *BioVision Pricing*\n\n"
             "Is build mein payments disabled hain.\n"
-            "Aap demo/testing ke liye reports free mein bhej sakte hain."
+            "Aap reports free mein bhej sakte hain."
+        )
+
+    if payment_provider() == "upi_manual":
+        price = get_report_price_inr()
+        return (
+            "💰 *BioVision Pricing*\n\n"
+            f"🎁 First {FREE_REPORT_LIMIT} reports free\n"
+            f"💳 Uske baad *₹{price} per report*\n"
+            "UPI se direct payment kar sakte hain.\n"
+            "Payment link/QR ke liye `pay` bhejiye."
         )
 
     return (
         "💰 *BioVision Pricing*\n\n"
         "🎁 Free Trial: 3 reports free\n"
         "⭐ Premium Plan: ₹199 / 30 days\n"
-        "• Unlimited reports\n"
-        "• Fast Hindi explanations\n"
-        "• Report history access\n"
-        "• Better follow-up tracking\n\n"
-        "Premium activate karne ke liye `premium` ya `pay` bhejiye."
+        "Premium activate karne ke liye `pay` bhejiye."
     )
 
 
-async def get_payment_required_message(phone: str, name: str, payments_on: bool) -> str:
-    if not payments_on:
-        return (
-            "✅ Is build mein payments disabled hain.\n"
-            "Seedha apni report ki photo ya PDF bhejiye."
-        )
-
+async def get_razorpay_payment_message(phone: str) -> str:
     try:
-        payment_link = await create_payment_link(phone, name or "Patient")
+        payment_link = await create_payment_link(phone, "Patient")
         payment_text = f"👉 Premium unlock link:\n{payment_link}"
     except Exception as exc:
         print(f"Payment link creation failed: {exc}")
         payment_text = "Razorpay link abhi generate nahi ho paya. Team se contact karein."
 
     return (
-        "⚠️ *Aapke 3 free reports use ho chuke hain.*\n\n"
+        "⚠️ *Aapke free reports use ho chuke hain.*\n\n"
         "Unlimited reports ke liye Premium plan ₹199 / 30 days hai.\n"
         f"{payment_text}\n\n"
-        "Payment ke baad WhatsApp par report bhejte hi access unlock ho jayega."
+        "Payment ke baad report bhejte hi access unlock ho jayega."
     )
 
 
@@ -501,37 +679,48 @@ async def get_status_message(phone: str) -> str:
 
     report_count = details.get("report_count", 0)
     paid_until_raw = details.get("paid_until")
-    paid = await is_user_paid(phone)
-    payments_on = payments_enabled()
+    subscription_paid = await is_user_paid(phone)
+    paid_credits = await get_user_paid_credits(phone)
+    pending_payment = await get_latest_open_upi_payment(phone)
 
     lines = [
         "📊 *Aapka account status*",
         f"Used reports: {report_count}",
+        f"Paid credits: {paid_credits}",
     ]
 
-    if not payments_on:
-        lines.append("Payments disabled: unlimited demo mode active")
-    elif paid and paid_until_raw:
+    if subscription_paid and paid_until_raw:
         lines.append(f"Premium active till: {_format_date(paid_until_raw, include_time=True)}")
-    elif paid:
-        lines.append("Premium active hai.")
-    else:
-        remaining = max(FREE_REPORT_LIMIT - report_count, 0)
-        lines.append(f"Free reports remaining: {remaining}")
 
+    if pending_payment:
+        lines.append(
+            f"Pending payment: {pending_payment['payment_ref']} ({pending_payment.get('status', 'pending')})"
+        )
+
+    remaining_free = max(FREE_REPORT_LIMIT - report_count, 0)
+    lines.append(f"Free reports remaining: {remaining_free}")
     return "\n".join(lines)
 
 
-def get_welcome_message(name: str, report_count: int, paid: bool, payments_on: bool) -> str:
+def get_welcome_message(
+    name: str,
+    report_count: int,
+    subscription_paid: bool,
+    paid_credits: int,
+    payments_on: bool,
+) -> str:
     remaining = max(FREE_REPORT_LIMIT - report_count, 0)
-    if not payments_on:
+    if subscription_paid:
+        plan_line = "⭐ Premium active hai. Aap unlimited reports bhej sakte hain."
+    elif payments_on and payment_provider() == "upi_manual":
+        plan_line = (
+            f"🎁 Aapke paas {remaining} free report(s) bachi hain.\n"
+            f"💳 Paid credits: {paid_credits}"
+        )
+    elif not payments_on:
         plan_line = "🆓 Demo mode active hai. Aap reports free mein bhej sakte hain."
     else:
-        plan_line = (
-            "⭐ Premium active hai. Aap unlimited reports bhej sakte hain."
-            if paid
-            else f"🎁 Aapke paas {remaining} free report(s) bachi hain."
-        )
+        plan_line = f"🎁 Aapke paas {remaining} free report(s) bachi hain."
 
     return (
         f"🩺 *BioVision mein swagat hai!*\n\n"
@@ -539,7 +728,7 @@ def get_welcome_message(name: str, report_count: int, paid: bool, payments_on: b
         "Main aapki blood test report ko simple Hindi mein explain karta hoon.\n\n"
         f"{plan_line}\n\n"
         "Photo ya PDF bhejiye aur main important values, normal range, aur doctor se poochne wale sawal bataunga.\n\n"
-        "Commands: help, price, history, status"
+        "Commands: help, price, pay, paid <UTR>, history, status"
     )
 
 
@@ -549,19 +738,22 @@ def get_how_to_use() -> str:
         "1. Report ki clear photo ya PDF bhejiye\n"
         "2. 30-60 seconds wait kariye\n"
         "3. Hindi summary, abnormal values, aur doctor questions mil jayenge\n\n"
-        "Best results ke liye:\n"
-        "• photo seedhi ho\n"
-        "• poori report visible ho\n"
-        "• blur na ho\n\n"
-        "Supported reports: CBC, sugar, HbA1c, lipid profile, thyroid, LFT, KFT, vitamins, urine aur more."
+        "Free reports khatam hone ke baad `pay` bhejiye aur UPI se payment karke `paid <UTR>` reply karein."
     )
 
 
-def get_report_prompt(remaining: int, paid: bool, payments_on: bool) -> str:
-    if not payments_on:
-        header = "📄 Demo mode active hai. Apni report ki photo ya PDF bhejiye."
-    elif paid:
+def get_report_prompt(
+    remaining: int,
+    subscription_paid: bool,
+    paid_credits: int,
+    payments_on: bool,
+) -> str:
+    if subscription_paid:
         header = "📄 Premium active hai. Apni report ki photo ya PDF bhejiye."
+    elif payments_on and paid_credits > 0:
+        header = f"📄 Aapke paas {paid_credits} paid credit(s) hain. Report bhejiye."
+    elif not payments_on:
+        header = "📄 Demo mode active hai. Apni report ki photo ya PDF bhejiye."
     else:
         header = f"📄 Apni report ki photo ya PDF bhejiye.\nAapke paas {remaining} free report(s) bachi hain."
 
@@ -574,18 +766,26 @@ def get_report_prompt(remaining: int, paid: bool, payments_on: bool) -> str:
     )
 
 
-def get_follow_up_message(remaining: int, paid: bool, payments_on: bool) -> str:
-    if not payments_on:
-        trial_line = "Demo mode active hai, aap aur reports bhi bhej sakte hain."
-    elif paid:
-        trial_line = "Premium active hai, isliye aap aur reports bhi bhej sakte hain."
+def get_follow_up_message(
+    remaining: int,
+    subscription_paid: bool,
+    payments_on: bool,
+    used_paid_credit: bool,
+    credits_left: int,
+) -> str:
+    if subscription_paid:
+        plan_line = "Premium active hai, aap aur reports bhi bhej sakte hain."
+    elif used_paid_credit:
+        plan_line = f"Ek paid credit use hua. Credits left: {credits_left}"
+    elif not payments_on:
+        plan_line = "Demo mode active hai, aap aur reports bhi bhej sakte hain."
     else:
-        trial_line = f"Free reports remaining: {remaining}"
+        plan_line = f"Free reports remaining: {remaining}"
 
     return (
         "━━━━━━━━━━━━━━━━━━\n"
         "⚕️ Ye educational explanation hai. Final medical advice ke liye doctor se consult karein.\n\n"
-        f"{trial_line}\n"
+        f"{plan_line}\n"
         "History dekhne ke liye `history` bhejiye."
     )
 
@@ -644,3 +844,38 @@ def _payment_page_html(title: str, body: str) -> str:
         </body>
     </html>
     """
+
+
+def _matches_any(text: str, keywords: list[str]) -> bool:
+    return any(keyword in text for keyword in keywords)
+
+
+def _is_real_env_value(value: str | None) -> bool:
+    if not value:
+        return False
+
+    lowered = value.strip().lower()
+    placeholder_markers = [
+        "your_",
+        "your_key_here",
+        "https://your-",
+        "sk-ant-your",
+        "aiza_your",
+        "rzp_live_or_test_",
+        "rzp_test_your",
+        "upi@bank",
+    ]
+    return not any(marker in lowered for marker in placeholder_markers)
+
+
+def _upi_qr_url(payment_ref: str) -> str:
+    app_url = os.getenv("APP_URL", "").rstrip("/")
+    if not _is_real_env_value(app_url):
+        return ""
+    return f"{app_url}/payments/upi/qr/{payment_ref}.png"
+
+
+def _assert_admin_key(header_value: str) -> None:
+    admin_key = os.getenv("ADMIN_API_KEY", "")
+    if not admin_key or header_value != admin_key:
+        raise HTTPException(status_code=401, detail="Invalid admin key.")

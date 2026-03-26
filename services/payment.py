@@ -21,6 +21,10 @@ RAZORPAY_BASE = "https://api.razorpay.com/v1"
 MONTHLY_PRICE_PAISE = 19900
 
 
+def payment_provider() -> str:
+    return os.getenv("PAYMENT_PROVIDER", "upi_manual").strip().lower()
+
+
 def _looks_like_placeholder(value: str | None) -> bool:
     if not value:
         return True
@@ -38,6 +42,11 @@ def payments_enabled() -> bool:
     flag = os.getenv("PAYMENTS_ENABLED", "false").strip().lower()
     if flag not in {"1", "true", "yes", "on"}:
         return False
+
+    if payment_provider() == "upi_manual":
+        upi_vpa = os.getenv("UPI_VPA")
+        upi_name = os.getenv("UPI_PAYEE_NAME")
+        return not _looks_like_placeholder(upi_vpa) and not _looks_like_placeholder(upi_name)
 
     key_id = os.getenv("RAZORPAY_KEY_ID")
     key_secret = os.getenv("RAZORPAY_KEY_SECRET")
@@ -64,6 +73,9 @@ def _build_reference_id(phone: str) -> str:
 
 async def create_payment_link(phone: str, name: str) -> str:
     """Create a Razorpay payment link and store it locally."""
+    if payment_provider() != "razorpay":
+        raise RuntimeError("Razorpay payment links are disabled for the current payment provider.")
+
     if not payments_enabled():
         raise RuntimeError("Payments are disabled.")
 
@@ -127,6 +139,9 @@ async def create_payment_link(phone: str, name: str) -> str:
 
 
 async def is_user_paid(phone: str) -> bool:
+    if payment_provider() != "razorpay":
+        return False
+
     if not payments_enabled():
         return True
 
@@ -136,7 +151,7 @@ async def is_user_paid(phone: str) -> bool:
 
 
 def verify_webhook_signature(raw_body: bytes, signature: str) -> bool:
-    if not payments_enabled():
+    if payment_provider() != "razorpay" or not payments_enabled():
         return False
 
     secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
@@ -149,7 +164,7 @@ def verify_webhook_signature(raw_body: bytes, signature: str) -> bool:
 
 
 def verify_callback_signature(query_params: Mapping[str, str]) -> bool:
-    if not payments_enabled():
+    if payment_provider() != "razorpay" or not payments_enabled():
         return False
 
     key_secret = os.getenv("RAZORPAY_KEY_SECRET")
@@ -177,7 +192,7 @@ def verify_callback_signature(query_params: Mapping[str, str]) -> bool:
 
 
 async def activate_subscription_from_payment_link(payment_link_id: str) -> tuple[bool, bool]:
-    if not payments_enabled():
+    if payment_provider() != "razorpay" or not payments_enabled():
         return False, False
 
     from database.users import get_payment_link, mark_payment_link_paid, mark_user_as_paid
@@ -195,7 +210,7 @@ async def activate_subscription_from_payment_link(payment_link_id: str) -> tuple
 
 
 async def handle_payment_webhook(payload: dict, raw_body: bytes, signature: str) -> bool:
-    if not payments_enabled():
+    if payment_provider() != "razorpay" or not payments_enabled():
         return False
 
     if not verify_webhook_signature(raw_body, signature):

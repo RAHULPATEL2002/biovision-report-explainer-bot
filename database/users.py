@@ -1,7 +1,7 @@
 """
 database/users.py
 =================
-SQLite-backed storage for BioVision users, reports, and payment links.
+SQLite-backed storage for BioVision users, reports, subscriptions, and UPI payments.
 """
 
 from __future__ import annotations
@@ -36,8 +36,21 @@ def _resolve_db_path() -> str:
 DB_PATH = _resolve_db_path()
 
 
+async def _ensure_column(
+    db: aiosqlite.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    async with db.execute(f"PRAGMA table_info({table_name})") as cursor:
+        rows = await cursor.fetchall()
+    existing_columns = {row[1] for row in rows}
+    if column_name not in existing_columns:
+        await db.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_definition}")
+
+
 async def init_db() -> None:
-    """Create tables if they do not exist."""
+    """Create tables if they do not exist and apply simple migrations."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -48,6 +61,7 @@ async def init_db() -> None:
                 report_count INTEGER DEFAULT 0,
                 is_paid BOOLEAN DEFAULT 0,
                 paid_until TEXT,
+                paid_report_credits INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 last_active TEXT DEFAULT CURRENT_TIMESTAMP
             )
@@ -78,7 +92,34 @@ async def init_db() -> None:
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS upi_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payment_ref TEXT UNIQUE NOT NULL,
+                phone TEXT NOT NULL,
+                amount_inr INTEGER NOT NULL,
+                provider TEXT DEFAULT 'upi_manual',
+                status TEXT DEFAULT 'pending',
+                upi_uri TEXT,
+                utr TEXT,
+                note TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                proof_submitted_at TEXT,
+                approved_at TEXT,
+                approved_credits INTEGER DEFAULT 0
+            )
+            """
+        )
+
+        await _ensure_column(
+            db,
+            "users",
+            "paid_report_credits",
+            "paid_report_credits INTEGER DEFAULT 0",
+        )
         await db.commit()
+
     print(f"Database initialized at {DB_PATH}")
 
 
@@ -166,7 +207,11 @@ async def get_user_subscription_details(phone: str) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT is_paid, paid_until, report_count, name FROM users WHERE phone = ?",
+            """
+            SELECT is_paid, paid_until, report_count, name, paid_report_credits
+            FROM users
+            WHERE phone = ?
+            """,
             (phone,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -202,6 +247,57 @@ async def mark_user_as_paid(phone: str, months: int = 1) -> Optional[str]:
 
     print(f"User {phone} marked as paid until {paid_until_iso}")
     return paid_until_iso
+
+
+async def get_user_paid_credits(phone: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT paid_report_credits FROM users WHERE phone = ?",
+            (phone,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+
+
+async def add_user_paid_credits(phone: str, credits: int = 1) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE users
+            SET paid_report_credits = COALESCE(paid_report_credits, 0) + ?,
+                last_active = ?
+            WHERE phone = ?
+            """,
+            (credits, datetime.utcnow().isoformat(), phone),
+        )
+        await db.commit()
+
+    return await get_user_paid_credits(phone)
+
+
+async def consume_user_paid_credit(phone: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT paid_report_credits FROM users WHERE phone = ?",
+            (phone,),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        credits = int(row[0]) if row else 0
+        if credits <= 0:
+            return False
+
+        await db.execute(
+            """
+            UPDATE users
+            SET paid_report_credits = paid_report_credits - 1,
+                last_active = ?
+            WHERE phone = ?
+            """,
+            (datetime.utcnow().isoformat(), phone),
+        )
+        await db.commit()
+        return True
 
 
 async def save_report(phone: str, report_text: str, explanation: str) -> None:
@@ -283,3 +379,130 @@ async def mark_payment_link_paid(payment_link_id: str) -> bool:
         )
         await db.commit()
     return True
+
+
+async def get_latest_open_upi_payment(phone: str) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM upi_payments
+            WHERE phone = ? AND status IN ('pending', 'proof_submitted')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (phone,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else {}
+
+
+async def create_upi_payment_request(
+    payment_ref: str,
+    phone: str,
+    amount_inr: int,
+    upi_uri: str,
+    note: str,
+) -> dict:
+    existing = await get_latest_open_upi_payment(phone)
+    if existing and existing.get("amount_inr") == amount_inr:
+        return existing
+
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO upi_payments (payment_ref, phone, amount_inr, upi_uri, note, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (payment_ref, phone, amount_inr, upi_uri, note, now),
+        )
+        await db.commit()
+
+    return await get_upi_payment_by_ref(payment_ref)
+
+
+async def get_upi_payment_by_ref(payment_ref: str) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM upi_payments WHERE payment_ref = ?",
+            (payment_ref,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else {}
+
+
+async def submit_upi_payment_utr(phone: str, utr: str) -> dict:
+    payment = await get_latest_open_upi_payment(phone)
+    if not payment:
+        return {}
+
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE upi_payments
+            SET utr = ?, status = 'proof_submitted', proof_submitted_at = ?
+            WHERE payment_ref = ?
+            """,
+            (utr.strip(), now, payment["payment_ref"]),
+        )
+        await db.commit()
+
+    return await get_upi_payment_by_ref(payment["payment_ref"])
+
+
+async def get_pending_upi_payments(limit: int = 50) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM upi_payments
+            WHERE status IN ('pending', 'proof_submitted')
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def approve_upi_payment(payment_ref: str, credits: int = 1) -> dict:
+    payment = await get_upi_payment_by_ref(payment_ref)
+    if not payment:
+        return {}
+
+    if payment.get("status") == "approved":
+        return payment
+
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE upi_payments
+            SET status = 'approved', approved_at = ?, approved_credits = ?
+            WHERE payment_ref = ?
+            """,
+            (now, credits, payment_ref),
+        )
+        await db.commit()
+
+    await add_user_paid_credits(payment["phone"], credits)
+    return await get_upi_payment_by_ref(payment_ref)
+
+
+async def reject_upi_payment(payment_ref: str) -> dict:
+    payment = await get_upi_payment_by_ref(payment_ref)
+    if not payment:
+        return {}
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE upi_payments SET status = 'rejected' WHERE payment_ref = ?",
+            (payment_ref,),
+        )
+        await db.commit()
+
+    return await get_upi_payment_by_ref(payment_ref)
