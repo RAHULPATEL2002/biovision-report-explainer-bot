@@ -16,7 +16,7 @@ load_dotenv()
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT_TEMPLATE = """
 Tum BioVision ke medical AI ho. Tumhara kaam hai ki
 lab reports ko simple Hindi mein explain karo jaise
 ek dost explain kare - medical jargon bilkul nahi.
@@ -83,14 +83,59 @@ def _use_ollama() -> bool:
     return provider not in {"openrouter", "anthropic"} and not os.getenv("ANTHROPIC_API_KEY")
 
 
-async def _explain_with_ollama(user_prompt: str) -> str:
+def _build_system_prompt(language: str) -> str:
+    if language == "en":
+        return """
+You are BioVision's medical AI assistant.
+Explain lab reports in simple, patient-friendly English.
+
+Format:
+━━━━━━━━━━━━━━━━━━
+🩺 *YOUR REPORT SUMMARY*
+━━━━━━━━━━━━━━━━━━
+
+For each important test:
+[EMOJI] *TEST NAME*
+📌 Your result: [value] [unit]
+✅ Normal range: [range]
+💬 [2-3 simple lines in plain English]
+
+Use 🟢 for normal, 🔴 for abnormal, 🟡 for borderline.
+
+End with:
+━━━━━━━━━━━━━━━━━━
+❓ *ASK YOUR DOCTOR:*
+1. [question]
+2. [question]
+3. [question]
+
+⚕️ This is educational information only.
+Please consult your doctor for final medical advice.
+
+Important rules:
+- Do not claim a diagnosis
+- Use simple English, no jargon
+- Stay grounded in the report
+- Around 700 words maximum
+"""
+
+    return SYSTEM_PROMPT_TEMPLATE
+
+
+def _user_intro(language: str) -> str:
+    if language == "en":
+        return "Explain this lab report in patient-friendly English."
+    return "Neeche lab report ka extracted text diya gaya hai. Isse patient-friendly Hindi mein explain karo."
+
+
+async def _explain_with_ollama(user_prompt: str, system_prompt: str) -> str:
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
     model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         "stream": False,
@@ -109,7 +154,7 @@ async def _explain_with_ollama(user_prompt: str) -> str:
     return content
 
 
-async def _explain_with_openrouter(user_prompt: str) -> str:
+async def _explain_with_openrouter(user_prompt: str, system_prompt: str) -> str:
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Missing required environment variable: OPENROUTER_API_KEY")
@@ -126,7 +171,7 @@ async def _explain_with_openrouter(user_prompt: str) -> str:
         "max_tokens": 2048,
         "temperature": 0.2,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     }
@@ -142,8 +187,8 @@ async def _explain_with_openrouter(user_prompt: str) -> str:
     return content
 
 
-async def explain_report_in_hindi(ocr_text: str) -> str:
-    """Send OCR text to the configured AI provider and get a Hindi explanation."""
+async def explain_report_in_hindi(ocr_text: str, language: str = "hi") -> str:
+    """Send OCR text to the configured AI provider and get an explanation."""
     if not ocr_text or not ocr_text.strip():
         return "⚠️ Report text mil nahi paya. Kripya clear photo ya PDF dobara bhejein."
 
@@ -151,9 +196,10 @@ async def explain_report_in_hindi(ocr_text: str) -> str:
     if len(trimmed_text) > 6000:
         trimmed_text = trimmed_text[:6000] + "\n[report truncated]"
 
+    normalized_language = "en" if language.strip().lower().startswith("en") else "hi"
+    system_prompt = _build_system_prompt(normalized_language)
     user_prompt = f"""
-Neeche lab report ka extracted text diya gaya hai.
-Isse patient-friendly Hindi mein explain karo.
+{_user_intro(normalized_language)}
 
 LAB REPORT TEXT:
 {trimmed_text}
@@ -161,12 +207,12 @@ LAB REPORT TEXT:
 
     try:
         if _use_openrouter():
-            explanation = await _explain_with_openrouter(user_prompt)
+            explanation = await _explain_with_openrouter(user_prompt, system_prompt)
             print(f"OpenRouter generated {len(explanation)} characters")
             return explanation
 
         if _use_ollama():
-            explanation = await _explain_with_ollama(user_prompt)
+            explanation = await _explain_with_ollama(user_prompt, system_prompt)
             print(f"Ollama generated {len(explanation)} characters")
             return explanation
 
@@ -175,7 +221,7 @@ LAB REPORT TEXT:
             model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
             max_tokens=1400,
             temperature=0.2,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
 

@@ -58,6 +58,7 @@ async def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 phone TEXT UNIQUE NOT NULL,
                 name TEXT DEFAULT '',
+                preferred_language TEXT DEFAULT '',
                 report_count INTEGER DEFAULT 0,
                 is_paid BOOLEAN DEFAULT 0,
                 paid_until TEXT,
@@ -117,6 +118,12 @@ async def init_db() -> None:
             "users",
             "paid_report_credits",
             "paid_report_credits INTEGER DEFAULT 0",
+        )
+        await _ensure_column(
+            db,
+            "users",
+            "preferred_language",
+            "preferred_language TEXT DEFAULT ''",
         )
         await db.commit()
 
@@ -208,7 +215,7 @@ async def get_user_subscription_details(phone: str) -> dict:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
-            SELECT is_paid, paid_until, report_count, name, paid_report_credits
+            SELECT is_paid, paid_until, report_count, name, paid_report_credits, preferred_language
             FROM users
             WHERE phone = ?
             """,
@@ -273,6 +280,19 @@ async def add_user_paid_credits(phone: str, credits: int = 1) -> int:
         await db.commit()
 
     return await get_user_paid_credits(phone)
+
+
+async def update_user_language(phone: str, language: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE users
+            SET preferred_language = ?, last_active = ?
+            WHERE phone = ?
+            """,
+            (language.strip().lower(), datetime.utcnow().isoformat(), phone),
+        )
+        await db.commit()
 
 
 async def consume_user_paid_credit(phone: str) -> bool:

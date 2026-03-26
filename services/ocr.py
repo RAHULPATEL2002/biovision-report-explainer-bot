@@ -27,9 +27,14 @@ def _require_env(name: str) -> str:
 
 def _use_google_vision() -> bool:
     provider = os.getenv("OCR_PROVIDER", "").strip().lower()
-    if provider == "tesseract":
+    if provider in {"tesseract", "ocr_space"}:
         return False
     return bool(os.getenv("GOOGLE_VISION_API_KEY"))
+
+
+def _use_ocr_space() -> bool:
+    provider = os.getenv("OCR_PROVIDER", "").strip().lower()
+    return provider == "ocr_space" and bool(os.getenv("OCR_SPACE_API_KEY"))
 
 
 def _get_tesseract_cmd() -> str:
@@ -104,11 +109,41 @@ async def _ocr_base64_image(image_b64: str) -> str:
         return ""
 
 
+async def _ocr_space_file(file_bytes: bytes, filename: str) -> str:
+    api_key = _require_env("OCR_SPACE_API_KEY")
+    data = {
+        "apikey": api_key,
+        "language": os.getenv("OCR_SPACE_LANGUAGE", "eng"),
+        "isTable": "false",
+        "OCREngine": os.getenv("OCR_SPACE_ENGINE", "2"),
+        "scale": "true",
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(
+            "https://api.ocr.space/parse/image",
+            data=data,
+            files={"file": (filename, file_bytes)},
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+    if payload.get("IsErroredOnProcessing"):
+        print(f"OCR.Space returned error: {payload}")
+        return ""
+
+    parsed_results = payload.get("ParsedResults", [])
+    text_blocks = [item.get("ParsedText", "").strip() for item in parsed_results if item.get("ParsedText")]
+    return "\n".join(text_blocks).strip()
+
+
 async def extract_text_from_image_url(image_url: str) -> str:
     image_bytes = await _download_whatsapp_media(image_url)
     if _use_google_vision():
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         text = await _ocr_base64_image(image_b64)
+    elif _use_ocr_space():
+        text = await _ocr_space_file(image_bytes, "report-image.png")
     else:
         text = _ocr_with_tesseract_bytes(image_bytes)
     print(f"Image OCR extracted {len(text)} characters")
@@ -125,6 +160,12 @@ async def extract_text_from_pdf_url(pdf_url: str) -> str:
     document = None
     try:
         document = fitz.open(temp_path)
+        if _use_ocr_space():
+            extracted_text = await _ocr_space_file(pdf_bytes, "report.pdf")
+            if extracted_text:
+                print(f"OCR.Space extracted {len(extracted_text)} characters from PDF")
+                return extracted_text
+
         pages_text = []
         max_pages = min(document.page_count, 5)
 

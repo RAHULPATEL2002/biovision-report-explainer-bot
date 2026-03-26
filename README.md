@@ -1,12 +1,12 @@
 # BioVision WhatsApp Bot
 
-BioVision WhatsApp Bot helps users understand blood test and lab reports in simple Hindi using FastAPI, OpenRouter or Claude AI, OCR, WhatsApp Cloud API, and direct UPI or Razorpay payment flows.
+BioVision WhatsApp Bot helps users understand blood test and lab reports in simple Hindi or English using FastAPI, OpenRouter or Claude AI, OCR, WhatsApp Cloud API, and direct UPI or Razorpay payment flows.
 
 ## Features
 
 - WhatsApp webhook integration with Meta WhatsApp Cloud API
-- Hindi lab report explanations powered by OpenRouter, Anthropic, or Ollama
-- OCR support for report images and PDFs
+- Hindi and English lab report explanations powered by OpenRouter, Anthropic, or Ollama
+- OCR support for report images and PDFs through OCR.Space, Google Vision, or Tesseract
 - Free trial with paid report unlock flow
 - Direct UPI payment link and QR flow with admin approval
 - Report history stored in SQLite
@@ -16,7 +16,7 @@ BioVision WhatsApp Bot helps users understand blood test and lab reports in simp
 - Python
 - FastAPI
 - OpenRouter / Anthropic / Ollama
-- Google Vision OCR
+- OCR.Space / Google Vision / Tesseract OCR
 - WhatsApp Cloud API
 - UPI / Razorpay
 - SQLite
@@ -44,7 +44,7 @@ Create a `.env` file from `.env.example` and fill in:
 - `WHATSAPP_PHONE_NUMBER_ID`
 - `WHATSAPP_VERIFY_TOKEN`
 - `OPENROUTER_API_KEY`
-- `GOOGLE_VISION_API_KEY`
+- `OCR_SPACE_API_KEY` or `GOOGLE_VISION_API_KEY`
 - `UPI_VPA`
 - `UPI_PAYEE_NAME`
 - `ADMIN_API_KEY`
