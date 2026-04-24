@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BioVision — AI Report Explainer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0f0d;
+      --surface: #111a16;
+      --surface2: #162019;
+      --border: #1e2e25;
+      --green: #00e676;
+      --green-dim: #00c85a;
+      --green-glow: rgba(0,230,118,0.15);
+      --red: #ff5252;
+      --amber: #ffc107;
+      --text: #e8f5e9;
+      --text-muted: #6b8f74;
+      --text-faint: #3a5244;
+      --radius: 16px;
+      --font: 'Sora', sans-serif;
+      --mono: 'Space Mono', monospace;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Animated grid background */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(0,230,118,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,230,118,0.03) 1px, transparent 1px);
+      background-size: 40px 40px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* Glow orbs */
+    .orb {
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(120px);
+      pointer-events: none;
+      z-index: 0;
+      animation: float 8s ease-in-out infinite;
+    }
+    .orb-1 {
+      width: 400px; height: 400px;
+      background: rgba(0,230,118,0.06);
+      top: -100px; left: -100px;
+      animation-delay: 0s;
+    }
+    .orb-2 {
+      width: 300px; height: 300px;
+      background: rgba(0,200,90,0.04);
+      bottom: 100px; right: -50px;
+      animation-delay: 4s;
+    }
+    @keyframes float {
+      0%, 100% { transform: translateY(0px); }
+      50% { transform: translateY(-30px); }
+    }
+
+    /* Layout */
+    .container {
+      position: relative;
+      z-index: 1;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 0 20px;
+    }
+
+    /* Header */
+    header {
+      padding: 32px 0 20px;
+      text-align: center;
+    }
+
+    .logo {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .logo-icon {
+      width: 44px; height: 44px;
+      background: var(--green);
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      box-shadow: 0 0 24px var(--green-glow);
+    }
+
+    .logo-text {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      color: var(--text);
+    }
+
+    .logo-text span { color: var(--green); }
+
+    .tagline {
+      color: var(--text-muted);
+      font-size: 14px;
+      font-weight: 300;
+      letter-spacing: 0.5px;
+    }
+
+    /* Nav pills */
+    .nav-pills {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      margin-top: 20px;
+    }
+    .nav-pill {
+      padding: 6px 16px;
+      border-radius: 100px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text-muted);
+      font-family: var(--font);
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .nav-pill.active, .nav-pill:hover {
+      background: var(--green-glow);
+      border-color: var(--green);
+      color: var(--green);
+    }
+
+    /* Main card */
+    .main-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 36px;
+      margin: 24px 0;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .main-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--green), transparent);
+      opacity: 0.4;
+    }
+
+    /* Upload zone */
+    .upload-zone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 48px 24px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      position: relative;
+      background: var(--surface2);
+    }
+
+    .upload-zone:hover, .upload-zone.dragover {
+      border-color: var(--green);
+      background: var(--green-glow);
+      transform: scale(1.005);
+    }
+
+    .upload-zone input[type="file"] {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      cursor: pointer;
+      width: 100%;
+      height: 100%;
+    }
+
+    .upload-icon {
+      font-size: 48px;
+      margin-bottom: 16px;
+      display: block;
+      animation: bounce 2s ease-in-out infinite;
+    }
+    @keyframes bounce {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-6px); }
+    }
+
+    .upload-title {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    .upload-sub {
+      color: var(--text-muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .upload-formats {
+      margin-top: 16px;
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .format-badge {
+      padding: 3px 10px;
+      border-radius: 100px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      font-size: 11px;
+      font-family: var(--mono);
+      color: var(--text-muted);
+      letter-spacing: 0.5px;
+    }
+
+    /* File preview */
+    .file-preview {
+      display: none;
+      align-items: center;
+      gap: 14px;
+      padding: 16px 20px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-top: 16px;
+    }
+
+    .file-preview.show { display: flex; }
+
+    .file-icon-wrap {
+      width: 44px; height: 44px;
+      background: var(--green-glow);
+      border: 1px solid var(--green);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      flex-shrink: 0;
+    }
+
+    .file-info { flex: 1; min-width: 0; }
+    .file-name {
+      font-size: 14px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .file-size {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: var(--mono);
+    }
+
+    .file-remove {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 20px;
+      padding: 4px;
+      line-height: 1;
+      transition: color 0.2s;
+    }
+    .file-remove:hover { color: var(--red); }
+
+    /* Language toggle */
+    .options-row {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-top: 20px;
+      flex-wrap: wrap;
+    }
+
+    .option-label {
+      font-size: 13px;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .lang-toggle {
+      display: flex;
+      gap: 0;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .lang-btn {
+      padding: 8px 18px;
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      font-family: var(--font);
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .lang-btn.active {
+      background: var(--green);
+      color: #000;
+      font-weight: 600;
+    }
+
+    /* Submit button */
+    .submit-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      width: 100%;
+      padding: 16px 24px;
+      background: var(--green);
+      color: #000;
+      border: none;
+      border-radius: var(--radius);
+      font-family: var(--font);
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      margin-top: 24px;
+      transition: all 0.3s ease;
+      letter-spacing: 0.2px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .submit-btn::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, rgba(255,255,255,0.15), transparent);
+    }
+
+    .submit-btn:hover:not(:disabled) {
+      background: var(--green-dim);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 32px rgba(0,230,118,0.3);
+    }
+
+    .submit-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .submit-btn.loading .btn-text { display: none; }
+    .submit-btn .btn-loader { display: none; }
+    .submit-btn.loading .btn-loader { display: flex; align-items: center; gap: 10px; }
+
+    .spinner {
+      width: 20px; height: 20px;
+      border: 2px solid rgba(0,0,0,0.3);
+      border-top-color: #000;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Progress bar */
+    .progress-wrap {
+      display: none;
+      margin-top: 16px;
+    }
+    .progress-wrap.show { display: block; }
+    .progress-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+      font-family: var(--mono);
+    }
+    .progress-bar {
+      height: 4px;
+      background: var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: var(--green);
+      border-radius: 4px;
+      width: 0%;
+      transition: width 0.3s ease;
+      box-shadow: 0 0 8px var(--green);
+    }
+
+    /* Result section */
+    .result-section {
+      display: none;
+      margin-top: 0;
+    }
+
+    .result-section.show { display: block; }
+
+    .result-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 20px 28px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-bottom: none;
+      border-radius: 20px 20px 0 0;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .result-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    .result-badge {
+      padding: 4px 12px;
+      background: var(--green-glow);
+      border: 1px solid var(--green);
+      border-radius: 100px;
+      color: var(--green);
+      font-size: 11px;
+      font-family: var(--mono);
+      letter-spacing: 0.5px;
+    }
+
+    .result-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .action-btn {
+      padding: 8px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text-muted);
+      font-family: var(--font);
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .action-btn:hover {
+      border-color: var(--green);
+      color: var(--green);
+      background: var(--green-glow);
+    }
+
+    /* Report content */
+    .report-content {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-top: none;
+      border-radius: 0 0 20px 20px;
+      padding: 28px;
+      line-height: 1.8;
+      font-size: 15px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    /* Markdown-style formatting */
+    .report-content strong { color: var(--green); }
+
+    /* History section */
+    .history-section {
+      margin-top: 24px;
+    }
+
+    .section-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .history-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .history-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 18px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .history-item:hover {
+      border-color: var(--green);
+      background: var(--green-glow);
+    }
+
+    .history-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      flex-shrink: 0;
+      box-shadow: 0 0 6px var(--green);
+    }
+
+    .history-name {
+      flex: 1;
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .history-date {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: var(--mono);
+      white-space: nowrap;
+    }
+
+    /* Error */
+    .error-box {
+      display: none;
+      padding: 16px 20px;
+      background: rgba(255,82,82,0.08);
+      border: 1px solid rgba(255,82,82,0.3);
+      border-radius: var(--radius);
+      color: var(--red);
+      font-size: 14px;
+      margin-top: 16px;
+      line-height: 1.5;
+    }
+    .error-box.show { display: flex; align-items: flex-start; gap: 10px; }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      padding: 12px 20px;
+      background: var(--surface);
+      border: 1px solid var(--green);
+      border-radius: 12px;
+      color: var(--green);
+      font-size: 13px;
+      z-index: 1000;
+      transform: translateY(80px);
+      opacity: 0;
+      transition: all 0.3s ease;
+      max-width: 300px;
+    }
+    .toast.show {
+      transform: translateY(0);
+      opacity: 1;
+    }
+
+    /* Footer */
+    footer {
+      text-align: center;
+      padding: 32px 0 40px;
+      color: var(--text-faint);
+      font-size: 12px;
+      line-height: 1.8;
+    }
+
+    footer a { color: var(--text-muted); text-decoration: none; }
+    footer a:hover { color: var(--green); }
+
+    /* Responsive */
+    @media (max-width: 600px) {
+      .main-card { padding: 20px 16px; }
+      .options-row { gap: 10px; }
+      .result-header { padding: 16px; }
+      .report-content { padding: 20px 16px; font-size: 14px; }
+      .upload-zone { padding: 32px 16px; }
+      .submit-btn { font-size: 15px; }
+    }
+
+    /* Highlight sections */
+    .report-content .section-emoji {
+      font-size: 18px;
+    }
+
+    /* Pulse animation on logo */
+    .logo-icon {
+      animation: pulse-glow 3s ease-in-out infinite;
+    }
+    @keyframes pulse-glow {
+      0%, 100% { box-shadow: 0 0 24px rgba(0,230,118,0.3); }
+      50% { box-shadow: 0 0 40px rgba(0,230,118,0.6); }
+    }
+
+    /* Typing indicator */
+    .typing {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-muted);
+      font-size: 13px;
+      margin-top: 12px;
+      padding: 12px 16px;
+      background: var(--surface2);
+      border-radius: 10px;
+    }
+    .typing.show { display: flex; }
+    .typing-dots { display: flex; gap: 4px; }
+    .typing-dots span {
+      width: 6px; height: 6px;
+      background: var(--green);
+      border-radius: 50%;
+      animation: dot-bounce 1.2s ease-in-out infinite;
+    }
+    .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+    .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes dot-bounce {
+      0%, 80%, 100% { transform: scale(0.8); opacity: 0.5; }
+      40% { transform: scale(1.2); opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+
+  <div class="container">
+    <header>
+      <div class="logo">
+        <div class="logo-icon">🩺</div>
+        <div class="logo-text">Bio<span>Vision</span></div>
+      </div>
+      <p class="tagline">AI-powered blood test &amp; lab report explainer</p>
+      <div class="nav-pills">
+        <button class="nav-pill active" onclick="showTab('upload')">Upload Report</button>
+        <button class="nav-pill" onclick="showTab('history')">History</button>
+      </div>
+    </header>
+
+    <!-- Upload Tab -->
+    <div id="tab-upload">
+      <div class="main-card">
+        <div class="upload-zone" id="uploadZone">
+          <input type="file" id="fileInput" accept="image/jpeg,image/jpg,image/png,image/webp,application/pdf" />
+          <span class="upload-icon">📄</span>
+          <p class="upload-title">Drop your report here</p>
+          <p class="upload-sub">
+            Drag &amp; drop or click to select your blood test / lab report<br />
+            Works with scanned images and digital PDFs
+          </p>
+          <div class="upload-formats">
+            <span class="format-badge">JPG</span>
+            <span class="format-badge">PNG</span>
+            <span class="format-badge">WEBP</span>
+            <span class="format-badge">PDF</span>
+            <span class="format-badge">MAX 10MB</span>
+          </div>
+        </div>
+
+        <div class="file-preview" id="filePreview">
+          <div class="file-icon-wrap" id="fileIconWrap">📄</div>
+          <div class="file-info">
+            <div class="file-name" id="fileName">filename.pdf</div>
+            <div class="file-size" id="fileSize">0 KB</div>
+          </div>
+          <button class="file-remove" onclick="removeFile()">✕</button>
+        </div>
+
+        <div class="options-row">
+          <span class="option-label">Explanation Language:</span>
+          <div class="lang-toggle">
+            <button class="lang-btn active" data-lang="hindi" onclick="setLanguage('hindi', this)">🇮🇳 Hindi</button>
+            <button class="lang-btn" data-lang="english" onclick="setLanguage('english', this)">🇬🇧 English</button>
+          </div>
+        </div>
+
+        <button class="submit-btn" id="submitBtn" onclick="submitReport()" disabled>
+          <span class="btn-text">✨ Explain My Report</span>
+          <span class="btn-loader">
+            <span class="spinner"></span>
+            <span id="loadingText">Reading report...</span>
+          </span>
+        </button>
+
+        <div class="progress-wrap" id="progressWrap">
+          <div class="progress-label" id="progressLabel">Extracting text from image...</div>
+          <div class="progress-bar">
+            <div class="progress-fill" id="progressFill"></div>
+          </div>
+        </div>
+
+        <div class="error-box" id="errorBox">
+          <span>⚠️</span>
+          <span id="errorText">Something went wrong.</span>
+        </div>
+
+        <div class="typing" id="typing">
+          <div class="typing-dots">
+            <span></span><span></span><span></span>
+          </div>
+          <span>AI is analyzing your report...</span>
+        </div>
+      </div>
+
+      <!-- Result -->
+      <div class="result-section" id="resultSection">
+        <div class="result-header">
+          <div class="result-title">
+            <span>🩺</span>
+            <span id="resultFilename">Report Explanation</span>
+            <div class="result-badge" id="resultLangBadge">HINDI</div>
+          </div>
+          <div class="result-actions">
+            <button class="action-btn" onclick="copyResult()">📋 Copy</button>
+            <button class="action-btn" onclick="downloadResult()">⬇️ Download</button>
+          </div>
+        </div>
+        <div class="report-content" id="reportContent"></div>
+      </div>
+    </div>
+
+    <!-- History Tab -->
+    <div id="tab-history" style="display:none;">
+      <div class="main-card">
+        <div class="section-title">📂 Your Previous Reports</div>
+        <div class="history-list" id="historyList">
+          <div style="color:var(--text-muted);font-size:14px;text-align:center;padding:32px 0;">
+            No reports yet. Upload your first report to get started.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <p>BioVision uses Claude AI for explanations. Results are for educational purposes only.</p>
+      <p>Always consult a qualified doctor for medical advice. &nbsp;·&nbsp; <a href="https://github.com/RAHULPATEL2002/biovision-report-explainer-bot" target="_blank">GitHub</a></p>
+    </footer>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let selectedFile = null;
+    let selectedLang = 'hindi';
+    let sessionId = localStorage.getItem('biovision_session') || generateId();
+    let currentResult = '';
+
+    localStorage.setItem('biovision_session', sessionId);
+
+    function generateId() {
+      return Math.random().toString(36).substring(2) + Date.now().toString(36);
+    }
+
+    // File input
+    const fileInput = document.getElementById('fileInput');
+    const uploadZone = document.getElementById('uploadZone');
+
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files[0]) handleFile(e.target.files[0]);
+    });
+
+    // Drag & drop
+    uploadZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      uploadZone.classList.add('dragover');
+    });
+    uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
+    uploadZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      uploadZone.classList.remove('dragover');
+      if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+    });
+
+    function handleFile(file) {
+      const allowed = ['image/jpeg','image/jpg','image/png','image/webp','application/pdf'];
+      if (!allowed.includes(file.type)) {
+        showError('Only JPG, PNG, WEBP images and PDF files are supported.');
+        return;
+      }
+      if (file.size > 10 * 1024 * 1024) {
+        showError('File is too large. Maximum size is 10MB.');
+        return;
+      }
+
+      selectedFile = file;
+      hideError();
+
+      // Update preview
+      document.getElementById('fileName').textContent = file.name;
+      document.getElementById('fileSize').textContent = formatSize(file.size);
+      document.getElementById('fileIconWrap').textContent = file.type === 'application/pdf' ? '📑' : '🖼️';
+      document.getElementById('filePreview').classList.add('show');
+      document.getElementById('submitBtn').disabled = false;
+
+      // Hide result
+      document.getElementById('resultSection').classList.remove('show');
+    }
+
+    function removeFile() {
+      selectedFile = null;
+      fileInput.value = '';
+      document.getElementById('filePreview').classList.remove('show');
+      document.getElementById('submitBtn').disabled = true;
+      hideError();
+    }
+
+    function setLanguage(lang, btn) {
+      selectedLang = lang;
+      document.querySelectorAll('.lang-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+    }
+
+    function formatSize(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    async function submitReport() {
+      if (!selectedFile) return;
+
+      const btn = document.getElementById('submitBtn');
+      btn.disabled = true;
+      btn.classList.add('loading');
+      hideError();
+      document.getElementById('resultSection').classList.remove('show');
+
+      // Progress animation
+      const progressWrap = document.getElementById('progressWrap');
+      const progressFill = document.getElementById('progressFill');
+      const progressLabel = document.getElementById('progressLabel');
+      const typing = document.getElementById('typing');
+
+      progressWrap.classList.add('show');
+      progressFill.style.width = '15%';
+      progressLabel.textContent = 'Uploading report...';
+
+      const steps = [
+        { width: '35%', label: 'Extracting text from report...', delay: 800 },
+        { width: '60%', label: 'AI is reading your values...', delay: 1800 },
+        { width: '80%', label: 'Generating explanation...', delay: 3000 },
+      ];
+
+      let stepIndex = 0;
+      const stepInterval = setInterval(() => {
+        if (stepIndex < steps.length) {
+          const s = steps[stepIndex++];
+          progressFill.style.width = s.width;
+          progressLabel.textContent = s.label;
+          if (stepIndex === 2) typing.classList.add('show');
+        }
+      }, 1200);
+
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+      formData.append('language', selectedLang);
+      formData.append('session_id', sessionId);
+
+      try {
+        const resp = await fetch('/api/explain', { method: 'POST', body: formData });
+        const data = await resp.json();
+
+        clearInterval(stepInterval);
+        progressFill.style.width = '100%';
+        progressLabel.textContent = 'Done!';
+        typing.classList.remove('show');
+
+        if (!resp.ok) {
+          throw new Error(data.detail || 'Something went wrong.');
+        }
+
+        setTimeout(() => {
+          progressWrap.classList.remove('show');
+          showResult(data);
+          loadHistory();
+        }, 400);
+
+      } catch (err) {
+        clearInterval(stepInterval);
+        progressWrap.classList.remove('show');
+        typing.classList.remove('show');
+        showError(err.message || 'Request failed. Check your connection and try again.');
+      } finally {
+        btn.disabled = false;
+        btn.classList.remove('loading');
+      }
+    }
+
+    function showResult(data) {
+      currentResult = data.explanation;
+
+      document.getElementById('resultFilename').textContent = data.filename || 'Report';
+      document.getElementById('resultLangBadge').textContent = selectedLang === 'hindi' ? 'HINDI' : 'ENGLISH';
+      document.getElementById('reportContent').textContent = data.explanation;
+
+      const section = document.getElementById('resultSection');
+      section.classList.add('show');
+      section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    function showError(msg) {
+      const box = document.getElementById('errorBox');
+      document.getElementById('errorText').textContent = msg;
+      box.classList.add('show');
+    }
+
+    function hideError() {
+      document.getElementById('errorBox').classList.remove('show');
+    }
+
+    function copyResult() {
+      navigator.clipboard.writeText(currentResult).then(() => showToast('✅ Copied to clipboard!'));
+    }
+
+    function downloadResult() {
+      const blob = new Blob([currentResult], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'biovision-report.txt';
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('⬇️ Download started!');
+    }
+
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 3000);
+    }
+
+    function showTab(tab) {
+      document.getElementById('tab-upload').style.display = tab === 'upload' ? 'block' : 'none';
+      document.getElementById('tab-history').style.display = tab === 'history' ? 'block' : 'none';
+      document.querySelectorAll('.nav-pill').forEach((p, i) => {
+        p.classList.toggle('active', (tab === 'upload' && i === 0) || (tab === 'history' && i === 1));
+      });
+      if (tab === 'history') loadHistory();
+    }
+
+    async function loadHistory() {
+      try {
+        const resp = await fetch(`/api/reports/${sessionId}`);
+        const data = await resp.json();
+        const list = document.getElementById('historyList');
+
+        if (!data.reports || data.reports.length === 0) {
+          list.innerHTML = `<div style="color:var(--text-muted);font-size:14px;text-align:center;padding:32px 0;">No reports yet. Upload your first report to get started.</div>`;
+          return;
+        }
+
+        list.innerHTML = data.reports.map(r => `
+          <div class="history-item" onclick="loadHistoryReport(${r.id})">
+            <div class="history-dot"></div>
+            <div class="history-name">📄 ${escHtml(r.filename)}</div>
+            <div class="history-date">${formatDate(r.created_at)}</div>
+          </div>
+        `).join('');
+      } catch (e) { /* silent */ }
+    }
+
+    async function loadHistoryReport(id) {
+      try {
+        const resp = await fetch(`/api/report/${id}`);
+        const data = await resp.json();
+        showTab('upload');
+        document.getElementById('resultFilename').textContent = data.filename || 'Report';
+        document.getElementById('resultLangBadge').textContent = (data.language || 'hindi').toUpperCase();
+        document.getElementById('reportContent').textContent = data.explanation;
+        currentResult = data.explanation;
+        document.getElementById('resultSection').classList.add('show');
+        document.getElementById('resultSection').scrollIntoView({ behavior: 'smooth' });
+      } catch (e) { showToast('⚠️ Could not load report.'); }
+    }
+
+    function formatDate(iso) {
+      try {
+        const d = new Date(iso);
+        return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+      } catch { return iso; }
+    }
+
+    function escHtml(str) {
+      return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    // Load history on startup
+    loadHistory();
+  </script>
+</body>
+</html>
